@@ -1,0 +1,67 @@
+{
+  "timestamp": "2026-11-10T17:24:03Z",
+  "total_duration_sec": 79.98,
+  "all_gates_passed": true,
+  "gates": {
+    "G1_immutability": true,
+    "G2_feasibility": true,
+    "G3_zero_hallucination": true,
+    "G4_zero_false_alarms": true,
+    "G5_zero_domain_leaks": true,
+    "G6_deterministic_reproducibility": true
+  },
+  "domain_leaks_detected": [],
+  "pillars": {
+    "P1_Fidelidad_Estructural_AST": 100.0,
+    "P2_Precision_Diagnostica_Auditoria": 98.48,
+    "P3_Optimalidad_Factibilidad_Recetas": 100.0,
+    "P4_Robustez_Estocastica_Empirica": 100.0,
+    "P5_Copiloto_Veracidad_Adversarial": 100.0,
+    "P6_Integridad_UI_Inmutabilidad": 100.0,
+    "P7_Eficiencia_Computacional": 100.0,
+    "P8_Generalizacion_Pureza_Cero_Fugas": 100.0
+  },
+  "ui_p6_metrics": {
+    "score": 100.0,
+    "api_ok": true,
+    "security_ok": true,
+    "reactivity_ok": true,
+    "paths_latency_ms": 13.25,
+    "evaluate_latency_ms": 8.96,
+    "importance_latency_ms": 10.24,
+    "ingest_latency_ms": 5449.42
+  },
+  "IAI_score": 99.7,
+  "suites": {
+    "M0_Base_Case": {
+      "instances": 1,
+      "mean_p1_accuracy": 100.0,
+      "mean_p2_diagnostic": 100.0,
+      "max_optimality_gap_pct": 0.0
+    },
+    "M1_Structural_Variants": {
+      "instances": 8,
+      "mean_p1_accuracy": 100.0,
+      "mean_p2_diagnostic": 100.0,
+      "max_optimality_gap_pct": 0.0
+    },
+    "M2_MultiDomain_Procedural": {
+      "instances": 6,
+      "mean_p1_accuracy": 100.0,
+      "mean_p2_diagnostic": 97.22,
+      "max_optimality_gap_pct": 0.0
+    },
+    "M3_Sealed_Holdout": {
+      "instances": 3,
+      "mean_p1_accuracy": 100.0,
+      "mean_p2_diagnostic": 94.44,
+      "max_optimality_gap_pct": 0.0
+    },
+    "M4_Universal_MultiSource": {
+      "instances": 4,
+      "mean_p1_accuracy": 100.0,
+      "mean_p2_diagnostic": 100.0,
+      "max_optimality_gap_pct": 0.0
+    }
+  }
+}

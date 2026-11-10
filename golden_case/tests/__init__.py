@@ -1,0 +1,1 @@
+"""Golden case tests package."""

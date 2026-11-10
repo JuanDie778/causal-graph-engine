@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / ambient
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Caches and test environments
+.pytest_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# Environments and OS
+.env
+.venv
+env/
+venv/
+ENV/
+.DS_Store
+Thumbs.db
+*.log
+tmp/
+temp/
+
+# Benchmark temporary variants
+benchmark_variants/

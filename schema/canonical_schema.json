@@ -1,0 +1,174 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CausalGraphEngineSchema",
+  "description": "Esquema de datos canónico para el Causal Graph Engine (CGE)",
+  "type": "object",
+  "required": ["system_id", "version", "nodes", "edges", "constraints"],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "system_id": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "category", "data_type", "source_reference"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string",
+            "enum": ["exogenous", "control", "state", "target"]
+          },
+          "data_type": {
+            "type": "string",
+            "enum": ["continuous", "discrete", "boolean", "categorical"]
+          },
+          "source_reference": {
+            "type": "object",
+            "properties": {
+              "file": {
+                "type": ["string", "null"]
+              },
+              "entity": {
+                "type": ["string", "null"]
+              },
+              "line_range": {
+                "type": ["array", "null"],
+                "items": {
+                  "type": "integer"
+                },
+                "minItems": 2,
+                "maxItems": 2
+              },
+              "column_name": {
+                "type": ["string", "null"]
+              }
+            }
+          },
+          "current_value": {
+            "type": ["number", "string", "boolean", "null"]
+          },
+          "bounds": {
+            "type": "object",
+            "properties": {
+              "min": {
+                "type": ["number", "null"]
+              },
+              "max": {
+                "type": ["number", "null"]
+              }
+            }
+          },
+          "distribution": {
+            "type": ["object", "null"]
+          },
+          "characteristic_scale": {
+            "type": ["number", "null"]
+          },
+          "symbolic_expr": {
+            "type": ["string", "null"]
+          },
+          "discontinuities": {
+            "type": ["array", "null"]
+          },
+          "clarke_kink_index": {
+            "type": ["number", "null"]
+          },
+          "fidelity": {
+            "type": ["object", "null"],
+            "properties": {
+              "verified": {
+                "type": "boolean"
+              },
+              "max_rel_error": {
+                "type": ["number", "null"]
+              },
+              "reason": {
+                "type": ["string", "null"]
+              }
+            }
+          }
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source", "target", "type"],
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["exact_code", "discrete_rule", "empirical_data"]
+          },
+          "sensitivity_weight": {
+            "type": ["number", "null"]
+          },
+          "dimensionless_elasticity": {
+            "type": ["number", "null"]
+          },
+          "confidence": {
+            "type": ["number", "null"]
+          },
+          "exact_mechanism": {
+            "type": ["object", "null"],
+            "properties": {
+              "engine": {
+                "type": "string",
+                "enum": ["python_callable", "sympy_expr", "smt_clause", "statistical_regression"]
+              },
+              "definition": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "expression"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["hard", "soft"]
+          },
+          "expression": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "is_active": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": ["object", "null"]
+    }
+  }
+}

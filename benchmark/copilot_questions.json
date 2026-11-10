@@ -1,0 +1,78 @@
+{
+  "questions": [
+    {
+      "id": "Q1",
+      "question": "¿Qué palancas de control afectan directa o indirectamente al beneficio neto?",
+      "expected_cited_nodes": ["price", "marketing_budget", "order_qty"],
+      "expected_control_set": ["price", "marketing_budget", "order_qty"],
+      "must_contain": ["price", "marketing_budget", "order_qty"]
+    },
+    {
+      "id": "Q2",
+      "question": "¿Por qué brand_awareness no influye en la rentabilidad del negocio?",
+      "expected_cited_nodes": ["brand_awareness", "profit"],
+      "must_contain": ["muerto", "dJ", "desconectado"]
+    },
+    {
+      "id": "Q3",
+      "question": "¿Qué beneficio neto obtengo si subo el precio a 5.0 manteniendo marketing en 500 y pedido en 500?",
+      "expected_cited_nodes": ["price", "sales", "revenue", "profit"],
+      "expected_number": 1325.0,
+      "tolerance": 1.0
+    },
+    {
+      "id": "Q4",
+      "question": "¿Es factible alcanzar un beneficio objetivo de 5000€?",
+      "expected_cited_nodes": ["profit"],
+      "expected_cited_constraints": ["c_budget"],
+      "expected_status": "INFEASIBLE",
+      "must_contain": ["INFEASIBLE", "presupuesto"]
+    },
+    {
+      "id": "Q5",
+      "question": "¿Cuál es la política óptima de precio, marketing y pedido para maximizar el beneficio?",
+      "expected_cited_nodes": ["price", "marketing_budget", "order_qty", "profit"],
+      "expected_controls": {
+        "price_min": 5.40,
+        "price_max": 5.50,
+        "marketing_min": 420.0,
+        "marketing_max": 435.0,
+        "order_qty": 800
+      },
+      "expected_profit_min": 2980.0
+    },
+    {
+      "id": "Q6",
+      "question": "¿Existe alguna discrepancia entre la documentación y la implementación del código?",
+      "expected_cited_nodes": ["fees"],
+      "expected_cited_files": ["golden_case/README.md", "golden_case/finance.py"],
+      "must_contain": ["2%", "3%", "comisión"]
+    },
+    {
+      "id": "Q7",
+      "question": "¿Qué impacto financiero tiene seguir la recomendación del módulo local de inventario?",
+      "expected_cited_nodes": ["order_qty", "profit"],
+      "expected_loss_approx": 680.88,
+      "must_contain": ["local", "500", "pérdida"]
+    },
+    {
+      "id": "Q8",
+      "question": "¿Se detecta alguna violación de invariantes contables en las operaciones?",
+      "expected_cited_constraints": ["c_ledger"],
+      "expected_cited_functions": ["process_refund"],
+      "must_contain": ["débito", "partida doble", "c_ledger"]
+    },
+    {
+      "id": "Q9",
+      "question": "¿Qué ocurre con el coste unitario cuando el pedido alcanza o supera las 800 unidades?",
+      "expected_cited_nodes": ["order_qty", "unit_cost"],
+      "must_contain": ["1.20", "1.00", "descuento"]
+    },
+    {
+      "id": "Q10",
+      "question": "¿Qué nodo presenta fragilidad ante la volatilidad de la demanda base en el punto óptimo?",
+      "expected_cited_nodes": ["sales", "demand", "base_demand"],
+      "must_contain": ["frágil", "min", "800"]
+    }
+  ]
+}

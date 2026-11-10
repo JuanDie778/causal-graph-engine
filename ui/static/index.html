@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CGE — Visualizador Causal Multidimensional y Copiloto</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/vendor/cytoscape.min.js"></script>
+  <script src="/static/vendor/dagre.min.js"></script>
+  <script src="/static/vendor/cytoscape-dagre.js"></script>
+</head>
+<body>
+  <!-- Header / Barra Superior -->
+  <header class="topbar">
+    <div class="brand-group">
+      <div class="logo-badge">CGE</div>
+      <div>
+        <h1 class="app-title">Causal Graph Engine</h1>
+        <span class="app-subtitle">Navegador Multidimensional y Copiloto Causal</span>
+      </div>
+    </div>
+
+    <div class="system-meta" id="system-meta">
+      <span class="meta-tag">Sistema: <strong id="meta-system-id">—</strong></span>
+      <span class="meta-tag">Versión: <code id="meta-version">—</code></span>
+      <span class="meta-tag">Objetivo: <strong id="meta-target-id">—</strong></span>
+    </div>
+
+    <div class="category-legend">
+      <span class="badge badge-u">U: Exógenas</span>
+      <span class="badge badge-x">X: Palancas</span>
+      <span class="badge badge-v">V: Estado</span>
+      <span class="badge badge-j">J: Target</span>
+    </div>
+
+    <div class="ingest-controls">
+      <input type="text" id="ingest-input" placeholder="Directorio objetivo..." class="input-dark">
+      <button id="btn-ingest" class="btn btn-primary">Ingestar</button>
+      <button id="btn-fit-view" class="btn btn-secondary">Centrar</button>
+    </div>
+  </header>
+
+  <!-- Contenedor Principal (3 Columnas) -->
+  <main class="main-layout">
+    <!-- Panel Izquierdo: Alertas e Inspección de Nodo / Código -->
+    <aside class="sidebar sidebar-left">
+      <div class="panel-section">
+        <h2 class="section-title">Inspector de Nodo</h2>
+        <div id="inspector-content" class="inspector-box">
+          <p class="placeholder-text">Haz clic en un nodo del grafo para inspeccionar sus atributos, derivadas y código fuente real.</p>
+        </div>
+      </div>
+
+      <div class="panel-section source-section">
+        <h2 class="section-title">Código Fuente Trazable</h2>
+        <div class="code-meta" id="code-meta">Archivo: — | Entidad: —</div>
+        <pre class="code-viewer"><code id="source-code-view">// Selecciona un nodo para cargar el fragmento de código exacto</code></pre>
+      </div>
+
+      <div class="panel-section alerts-section">
+        <div class="section-header-row">
+          <h2 class="section-title">Alertas de Auditoría (T1-T7)</h2>
+          <span class="alerts-count-badge" id="alerts-count">0</span>
+        </div>
+        <div id="alerts-list" class="alerts-container">
+          <p class="placeholder-text">Sin alertas detectadas.</p>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Centro: Lienzo Cytoscape -->
+    <section class="canvas-wrapper">
+      <div id="cy" class="cytoscape-canvas"></div>
+      <div class="canvas-overlay-target">
+        <span class="target-label">Valor Objetivo Actual:</span>
+        <span class="target-value" id="canvas-target-val">—</span>
+      </div>
+    </section>
+
+    <!-- Panel Derecho: Qué Pasa Si, Receta Óptima, Rutas y Copiloto -->
+    <aside class="sidebar sidebar-right">
+      <!-- Pestañas de Interacción -->
+      <nav class="tabs-bar">
+        <button class="tab-btn active" data-tab="tab-whatif">Qué Pasa Si</button>
+        <button class="tab-btn" data-tab="tab-recipe">Receta Óptima</button>
+        <button class="tab-btn" data-tab="tab-paths">Rutas Top-K</button>
+        <button class="tab-btn" data-tab="tab-copilot">Copiloto</button>
+      </nav>
+
+      <!-- Tab 1: Qué Pasa Si (Sliders) -->
+      <div id="tab-whatif" class="tab-content active">
+        <div class="tab-intro">
+          Ajusta las palancas de control en tiempo real para observar la respuesta del sistema.
+        </div>
+        <div id="sliders-container" class="sliders-list">
+          <p class="placeholder-text">Cargando palancas de control...</p>
+        </div>
+        <div class="evaluation-summary">
+          <div class="eval-row">
+            <span>Objetivo Evaluado:</span>
+            <strong id="evaluate-target-display" class="highlight-val">—</strong>
+          </div>
+          <button id="btn-reset-sliders" class="btn btn-secondary btn-full">Restablecer Valores</button>
+        </div>
+      </div>
+
+      <!-- Tab 2: Receta de Intervención Óptima -->
+      <div id="tab-recipe" class="tab-content">
+        <div class="tab-intro">
+          Calcula la combinación óptima de palancas que maximiza el objetivo respetando restricciones.
+        </div>
+        <div class="form-group">
+          <label for="recipe-target-goal">Meta Específica (Opcional, prueba de factibilidad):</label>
+          <input type="number" id="recipe-target-goal" placeholder="Dejar vacío para óptimo global" class="input-dark">
+        </div>
+        <div class="form-group-checkbox">
+          <label class="switch-label">
+            <input type="checkbox" id="cvar-toggle">
+            <span class="switch-text">Modo CVaR (Aversión al Riesgo Estocástico)</span>
+          </label>
+        </div>
+        <button id="btn-calc-recipe" class="btn btn-primary btn-full">Calcular Receta Óptima</button>
+
+        <div id="recipe-output" class="recipe-results-box hidden">
+          <div class="result-status-row">
+            <span>Estado:</span>
+            <span id="recipe-status" class="status-badge">—</span>
+          </div>
+          <div class="result-stat-row">
+            <span>Objetivo Resultante:</span>
+            <strong id="recipe-objective-val">—</strong>
+          </div>
+          <div class="result-stat-row">
+            <span>Margen de Presupuesto:</span>
+            <span id="recipe-budget-margin">—</span>
+          </div>
+          <div class="controls-diff-container">
+            <h4>Valores de Palanca Recomendados:</h4>
+            <div id="recipe-controls-list"></div>
+          </div>
+          <div id="recipe-infeasible-box" class="infeasible-details hidden">
+            <h4>Diagnóstico de Infactibilidad (KKT):</h4>
+            <p id="recipe-blocking-msg"></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 3: Rutas Top-K -->
+      <div id="tab-paths" class="tab-content">
+        <div class="tab-intro">
+          Caminos causales de mayor producto multiplicativo en el semianillo Tropical Max-Product.
+        </div>
+        <div id="paths-list" class="paths-container">
+          <p class="placeholder-text">Cargando rutas causales...</p>
+        </div>
+      </div>
+
+      <!-- Tab 4: Copiloto Agéntico -->
+      <div id="tab-copilot" class="tab-content">
+        <div class="copilot-chat-container">
+          <div id="copilot-messages" class="copilot-messages">
+            <div class="chat-bubble chat-agent">
+              ¡Hola! Soy tu Copiloto Causal respaldado exclusivamente en el CausalIR. Pregúntame sobre palancas, impactos, factibilidad o alertas detectadas.
+            </div>
+          </div>
+
+          <div class="quick-prompts">
+            <button class="chip-btn" data-query="¿Cuáles son las palancas con mayor impacto?">Ranking de Impacto</button>
+            <button class="chip-btn" data-query="¿Es factible duplicar el objetivo?">Factibilidad de Meta</button>
+            <button class="chip-btn" data-query="¿Hay discrepancias entre código y documentación?">Discrepancias</button>
+            <button class="chip-btn" data-query="¿Existen nodos frágiles en el sistema?">Nodos Frágiles</button>
+          </div>
+
+          <form id="copilot-form" class="copilot-input-row">
+            <input type="text" id="copilot-input" placeholder="Formula una pregunta causal..." class="input-dark">
+            <button type="submit" id="btn-copilot-send" class="btn btn-primary">Enviar</button>
+          </form>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

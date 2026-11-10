@@ -1,0 +1,472 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "system_id": "cge_golden_case_coffee",
+  "version": "1.0.0",
+  "nodes": [
+    {
+      "id": "base_demand",
+      "label": "Demanda Base Exógena",
+      "category": "exogenous",
+      "data_type": "continuous",
+      "source_reference": {
+        "file": "golden_case/environment.py",
+        "entity": "sample_base_demand",
+        "line_range": [
+          9,
+          14
+        ]
+      },
+      "current_value": 1000.0,
+      "bounds": {
+        "min": 0.0,
+        "max": null
+      }
+    },
+    {
+      "id": "price",
+      "label": "Precio de Venta",
+      "category": "control",
+      "data_type": "continuous",
+      "source_reference": {
+        "file": "golden_case/config.py",
+        "entity": "PRICE",
+        "line_range": [
+          4,
+          4
+        ]
+      },
+      "current_value": 3.5,
+      "bounds": {
+        "min": 2.0,
+        "max": 6.0
+      }
+    },
+    {
+      "id": "marketing_budget",
+      "label": "Presupuesto de Marketing",
+      "category": "control",
+      "data_type": "continuous",
+      "source_reference": {
+        "file": "golden_case/config.py",
+        "entity": "MARKETING_BUDGET",
+        "line_range": [
+          5,
+          5
+        ]
+      },
+      "current_value": 500.0,
+      "bounds": {
+        "min": 0.0,
+        "max": 2000.0
+      }
+    },
+    {
+      "id": "order_qty",
+      "label": "Cantidad de Pedido",
+      "category": "control",
+      "data_type": "discrete",
+      "source_reference": {
+        "file": "golden_case/config.py",
+        "entity": "ORDER_QTY",
+        "line_range": [
+          6,
+          6
+        ]
+      },
+      "current_value": 500,
+      "bounds": {
+        "min": 0,
+        "max": 1500
+      }
+    },
+    {
+      "id": "brand_awareness",
+      "label": "Notoriedad de Marca (Nodo Muerto T1)",
+      "category": "state",
+      "data_type": "continuous",
+      "source_reference": {
+        "file": "golden_case/marketing.py",
+        "entity": "calculate_brand_awareness",
+        "line_range": [
+          8,
+          23
+        ]
+      },
+      "current_value": 77.71,
+      "bounds": {
+        "min": 0.0,
+        "max": null
+      }
+    },
+    {
+      "id": "demand",
+      "label": "Demanda Estimada",
+      "category": "state",
+      "data_type": "continuous",
+      "source_reference": {
+        "file": "golden_case/demand.py",
+        "entity": "calculate_demand",
+        "line_range": [
+          5,
+          13
+        ]
+      },
+      "current_value": 1103.88,
+      "bounds": {
+        "min": 0.0,
+        "max": null
+      }
+    },
+    {
+      "id": "sales",
+      "label": "Ventas Efectivas",
+      "category": "state",
+      "data_type": "continuous",
+      "source_reference": {
+        "file": "golden_case/inventory.py",
+        "entity": "calculate_sales",
+        "line_range": [
+          17,
+          22
+        ]
+      },
+      "current_value": 500.0,
+      "bounds": {
+        "min": 0.0,
+        "max": 1500.0
+      }
+    },
+    {
+      "id": "unit_cost",
+      "label": "Coste Unitario",
+      "category": "state",
+      "data_type": "continuous",
+      "source_reference": {
+        "file": "golden_case/inventory.py",
+        "entity": "calculate_unit_cost",
+        "line_range": [
+          5,
+          14
+        ]
+      },
+      "current_value": 1.2,
+      "bounds": {
+        "min": 1.0,
+        "max": 1.2
+      }
+    },
+    {
+      "id": "holding_cost",
+      "label": "Coste de Almacenamiento",
+      "category": "state",
+      "data_type": "continuous",
+      "source_reference": {
+        "file": "golden_case/inventory.py",
+        "entity": "calculate_holding_cost",
+        "line_range": [
+          25,
+          28
+        ]
+      },
+      "current_value": 0.0,
+      "bounds": {
+        "min": 0.0,
+        "max": null
+      }
+    },
+    {
+      "id": "revenue",
+      "label": "Ingresos Brutos",
+      "category": "state",
+      "data_type": "continuous",
+      "source_reference": {
+        "file": "golden_case/finance.py",
+        "entity": "calculate_revenue",
+        "line_range": [
+          5,
+          7
+        ]
+      },
+      "current_value": 1750.0,
+      "bounds": {
+        "min": 0.0,
+        "max": null
+      }
+    },
+    {
+      "id": "fees",
+      "label": "Comisiones de Pasarela",
+      "category": "state",
+      "data_type": "continuous",
+      "source_reference": {
+        "file": "golden_case/finance.py",
+        "entity": "calculate_fees",
+        "line_range": [
+          10,
+          18
+        ]
+      },
+      "current_value": 52.5,
+      "bounds": {
+        "min": 0.0,
+        "max": null
+      }
+    },
+    {
+      "id": "profit",
+      "label": "Beneficio Neto Operativo (Target J)",
+      "category": "target",
+      "data_type": "continuous",
+      "source_reference": {
+        "file": "golden_case/finance.py",
+        "entity": "calculate_profit",
+        "line_range": [
+          21,
+          35
+        ]
+      },
+      "current_value": 597.5,
+      "bounds": {
+        "min": null,
+        "max": null
+      }
+    }
+  ],
+  "edges": [
+    {
+      "source": "base_demand",
+      "target": "demand",
+      "type": "exact_code",
+      "sensitivity_weight": 0.925,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "demand = base_demand * (1 - 0.15*(price-3)) + 8*sqrt(marketing_budget)"
+      }
+    },
+    {
+      "source": "price",
+      "target": "demand",
+      "type": "exact_code",
+      "sensitivity_weight": -150.0,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "ddemand/dprice = -0.15 * base_demand"
+      }
+    },
+    {
+      "source": "marketing_budget",
+      "target": "demand",
+      "type": "exact_code",
+      "sensitivity_weight": 0.178,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "ddemand/dmarketing = 4 / sqrt(marketing_budget)"
+      }
+    },
+    {
+      "source": "marketing_budget",
+      "target": "demand",
+      "type": "empirical_data",
+      "sensitivity_weight": 0.18,
+      "confidence": 0.95,
+      "exact_mechanism": {
+        "engine": "statistical_regression",
+        "definition": "estimated lift: 8.0 * sqrt(marketing_budget) from sales_history.csv"
+      }
+    },
+    {
+      "source": "marketing_budget",
+      "target": "brand_awareness",
+      "type": "exact_code",
+      "sensitivity_weight": 0.025,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "brand_awareness = 12.5 * log1p(marketing_budget)"
+      }
+    },
+    {
+      "source": "demand",
+      "target": "sales",
+      "type": "discrete_rule",
+      "sensitivity_weight": 0.0,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "sales = min(demand, order_qty)"
+      }
+    },
+    {
+      "source": "order_qty",
+      "target": "sales",
+      "type": "discrete_rule",
+      "sensitivity_weight": 1.0,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "sales = min(demand, order_qty)"
+      }
+    },
+    {
+      "source": "order_qty",
+      "target": "unit_cost",
+      "type": "discrete_rule",
+      "sensitivity_weight": -0.2,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "unit_cost = 1.20 if order_qty < 800 else 1.00"
+      }
+    },
+    {
+      "source": "order_qty",
+      "target": "holding_cost",
+      "type": "exact_code",
+      "sensitivity_weight": 0.2,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "holding_cost = 0.20 * max(0, order_qty - sales)"
+      }
+    },
+    {
+      "source": "sales",
+      "target": "holding_cost",
+      "type": "exact_code",
+      "sensitivity_weight": -0.2,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "holding_cost = 0.20 * max(0, order_qty - sales)"
+      }
+    },
+    {
+      "source": "price",
+      "target": "revenue",
+      "type": "exact_code",
+      "sensitivity_weight": 500.0,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "revenue = price * sales"
+      }
+    },
+    {
+      "source": "sales",
+      "target": "revenue",
+      "type": "exact_code",
+      "sensitivity_weight": 3.5,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "revenue = price * sales"
+      }
+    },
+    {
+      "source": "revenue",
+      "target": "fees",
+      "type": "exact_code",
+      "sensitivity_weight": 0.03,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "fees = 0.03 * revenue"
+      }
+    },
+    {
+      "source": "revenue",
+      "target": "profit",
+      "type": "exact_code",
+      "sensitivity_weight": 1.0,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "profit += revenue"
+      }
+    },
+    {
+      "source": "fees",
+      "target": "profit",
+      "type": "exact_code",
+      "sensitivity_weight": -1.0,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "profit -= fees"
+      }
+    },
+    {
+      "source": "unit_cost",
+      "target": "profit",
+      "type": "exact_code",
+      "sensitivity_weight": -500.0,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "profit -= unit_cost * order_qty"
+      }
+    },
+    {
+      "source": "order_qty",
+      "target": "profit",
+      "type": "exact_code",
+      "sensitivity_weight": -1.2,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "profit -= unit_cost * order_qty"
+      }
+    },
+    {
+      "source": "marketing_budget",
+      "target": "profit",
+      "type": "exact_code",
+      "sensitivity_weight": -1.0,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "profit -= marketing_budget"
+      }
+    },
+    {
+      "source": "holding_cost",
+      "target": "profit",
+      "type": "exact_code",
+      "sensitivity_weight": -1.0,
+      "confidence": 1.0,
+      "exact_mechanism": {
+        "engine": "python_callable",
+        "definition": "profit -= holding_cost"
+      }
+    }
+  ],
+  "constraints": [
+    {
+      "id": "c_budget",
+      "type": "hard",
+      "expression": "unit_cost * order_qty + marketing_budget <= 2500",
+      "description": "Presupuesto máximo de costes directos y marketing de 2500€"
+    },
+    {
+      "id": "c_ledger",
+      "type": "hard",
+      "expression": "sum(credits) - sum(debits) == 0",
+      "description": "Invariante contable de partida doble en el libro mayor"
+    },
+    {
+      "id": "c_stock",
+      "type": "hard",
+      "expression": "order_qty - sales >= 0",
+      "description": "Las ventas no pueden exceder las existencias disponibles"
+    },
+    {
+      "id": "c_price_bounds",
+      "type": "hard",
+      "expression": "2.0 <= price <= 6.0",
+      "description": "Rango admisible de fijación de precios en el mercado"
+    }
+  ]
+}
