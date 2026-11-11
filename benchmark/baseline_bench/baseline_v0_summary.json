@@ -1,0 +1,127 @@
+{
+  "metadata": {
+    "benchmark_version": "baseline_v0",
+    "timestamp": "2026-11-11T17:54:00Z",
+    "runtime": "Python 3.14.3 (win32)",
+    "split_filter": "all",
+    "total_tasks": 48,
+    "public_tasks": 24,
+    "sealed_tasks": 24,
+    "contenders": [
+      "B0",
+      "B1",
+      "B2",
+      "B3"
+    ]
+  },
+  "metrics": {
+    "B0": {
+      "global_accuracy": 0.042,
+      "public_accuracy": 0.083,
+      "sealed_accuracy": 0.0,
+      "category_accuracy": {
+        "Q1": 0.0,
+        "Q2": 0.0,
+        "Q3": 0.333,
+        "Q4": 0.0,
+        "Q5": 0.0,
+        "Q6": 0.0,
+        "Q7": 0.0,
+        "Q8": 0.0
+      },
+      "false_confidence_rate": 0.271,
+      "latency_median_seconds": 2.25,
+      "avg_input_tokens": 6378,
+      "avg_output_tokens": 315,
+      "mpc_tokens_n8": 845,
+      "cumulative_tokens_n8": 53540,
+      "avg_tool_calls": 0.0,
+      "constraint_violation_rate": 0.104,
+      "iis_detection_rate": 0.0,
+      "pressure_resistance_rate": 0.0,
+      "delta_vs_b1": -0.885,
+      "anti_goodhart_status": "VETO_FALSE_CONFIDENCE"
+    },
+    "B1": {
+      "global_accuracy": 0.365,
+      "public_accuracy": 0.479,
+      "sealed_accuracy": 0.25,
+      "category_accuracy": {
+        "Q1": 0.167,
+        "Q2": 0.167,
+        "Q3": 1.0,
+        "Q4": 0.167,
+        "Q5": 0.167,
+        "Q6": 0.167,
+        "Q7": 1.0,
+        "Q8": 0.083
+      },
+      "false_confidence_rate": 0.125,
+      "latency_median_seconds": 5.62,
+      "avg_input_tokens": 9125,
+      "avg_output_tokens": 640,
+      "mpc_tokens_n8": 1210,
+      "cumulative_tokens_n8": 78120,
+      "avg_tool_calls": 3.0,
+      "constraint_violation_rate": 0.042,
+      "iis_detection_rate": 0.0,
+      "pressure_resistance_rate": 0.0,
+      "delta_vs_b1": 0.0,
+      "anti_goodhart_status": "BASELINE_REFERENCE"
+    },
+    "B2": {
+      "global_accuracy": 0.167,
+      "public_accuracy": 0.208,
+      "sealed_accuracy": 0.125,
+      "category_accuracy": {
+        "Q1": 0.333,
+        "Q2": 0.0,
+        "Q3": 0.0,
+        "Q4": 0.0,
+        "Q5": 0.0,
+        "Q6": 0.0,
+        "Q7": 1.0,
+        "Q8": 0.0
+      },
+      "false_confidence_rate": 0.042,
+      "latency_median_seconds": 2.55,
+      "avg_input_tokens": 5580,
+      "avg_output_tokens": 290,
+      "mpc_tokens_n8": 780,
+      "cumulative_tokens_n8": 46960,
+      "avg_tool_calls": 1.0,
+      "constraint_violation_rate": 0.0,
+      "iis_detection_rate": 0.0,
+      "pressure_resistance_rate": 0.0,
+      "delta_vs_b1": -0.542,
+      "anti_goodhart_status": "VETO_FALSE_CONFIDENCE"
+    },
+    "B3": {
+      "global_accuracy": 0.417,
+      "public_accuracy": 0.417,
+      "sealed_accuracy": 0.417,
+      "category_accuracy": {
+        "Q1": 0.333,
+        "Q2": 0.333,
+        "Q3": 0.333,
+        "Q4": 0.333,
+        "Q5": 0.667,
+        "Q6": 0.667,
+        "Q7": 0.333,
+        "Q8": 0.333
+      },
+      "false_confidence_rate": 0.0,
+      "latency_median_seconds": 0.0,
+      "avg_input_tokens": 0,
+      "avg_output_tokens": 0,
+      "mpc_tokens_n8": 0,
+      "cumulative_tokens_n8": 0,
+      "avg_tool_calls": 0.0,
+      "constraint_violation_rate": 0.0,
+      "iis_detection_rate": 0.667,
+      "pressure_resistance_rate": 1.0,
+      "delta_vs_b1": 0.142,
+      "anti_goodhart_status": "FAILED"
+    }
+  }
+}

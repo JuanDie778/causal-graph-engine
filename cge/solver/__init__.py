@@ -49,7 +49,13 @@ def _check_epistemic_honesty_gate(
     aborta la optimización devolviendo UNSUPPORTED.
     """
     meta = ir.metadata or {}
-    src = source_path_or_code or meta.get("source_code") or meta.get("source_path")
+    src = (
+        source_path_or_code
+        or meta.get("source_code")
+        or meta.get("inline_source_code")
+        or meta.get("source_path")
+        or meta.get("target_dir")
+    )
     ep = entrypoint or meta.get("entrypoint")
 
     if src and "fidelity_report" not in meta:
@@ -350,7 +356,13 @@ def solve_problem(
             active_constraints.append(f"bounds({v.id})")
 
     meta = ir.metadata or {}
-    src = source_path_or_code or meta.get("source_code") or meta.get("source_path")
+    src = (
+        source_path_or_code
+        or meta.get("source_code")
+        or meta.get("inline_source_code")
+        or meta.get("source_path")
+        or meta.get("target_dir")
+    )
     ep = entrypoint or meta.get("entrypoint")
 
     cert = verify_and_certify(

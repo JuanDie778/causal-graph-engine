@@ -1,7 +1,7 @@
 """Suite Externa de Benchmark OR-Bench (20 Problemas Clásicos de Investigación Operativa, Fase 10)."""
 from __future__ import annotations
 import math
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from cge.ingest import compile_source_to_ir
 from cge.fidelity import certify_fidelity, evaluate_recipe_on_source
@@ -15,10 +15,16 @@ def get_all_or_bench_problems() -> List[Dict[str, Any]]:
     return get_public_problems() + get_sealed_problems()
 
 
+_OR_EVAL_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+
 def evaluate_single_or_problem(prob: Dict[str, Any]) -> Dict[str, Any]:
     """Ejecuta extremo a extremo un problema de OR-Bench: ingesta -> fidelidad -> solver -> verificación en código vs oráculo."""
     pid = prob["id"]
     src = prob["source_code"]
+    cache_key = (pid, src)
+    if cache_key in _OR_EVAL_CACHE:
+        return dict(_OR_EVAL_CACHE[cache_key])
     ep = prob.get("entrypoint")
     sense = prob.get("sense", "max")
     oracle = prob["oracle"]
@@ -73,7 +79,7 @@ def evaluate_single_or_problem(prob: Dict[str, Any]) -> Dict[str, Any]:
             if not code_ok and cert_status == "CERTIFIED_OPTIMAL":
                 false_confidence = True
 
-    return {
+    out = {
         "id": pid,
         "name": prob["name"],
         "split": "public" if pid.startswith("p") else "sealed",
@@ -94,6 +100,8 @@ def evaluate_single_or_problem(prob: Dict[str, Any]) -> Dict[str, Any]:
         "passed": passed,
         "false_confidence": false_confidence,
     }
+    _OR_EVAL_CACHE[cache_key] = out
+    return dict(out)
 
 
 def evaluate_or_bench_suite(split: str = "all") -> Dict[str, Any]:
@@ -117,16 +125,49 @@ def evaluate_or_bench_suite(split: str = "all") -> Dict[str, Any]:
     seal_rate = (100.0 * sum(1 for r in seal_res if r["passed"]) / len(seal_res)) if seal_res else 100.0
     overall_rate = (100.0 * passed_count / total) if total else 100.0
 
+    supported_res = [r for r in results if r["expected_status"] != "UNSUPPORTED"]
+    fid_rate = (
+        sum(1 for r in supported_res if r["fidelity_verified"]) / len(supported_res)
+        if supported_res
+        else 1.0
+    )
+    max_code_viol = max((float(r["constraint_violation_on_code"] or 0.0) for r in supported_res), default=0.0)
+
     return {
         "total_problems": total,
         "passed_problems": passed_count,
+        "pass_rate": round(overall_rate / 100.0, 4),
         "pass_rate_pct": round(overall_rate, 2),
+        "public_pass_rate": round(pub_rate / 100.0, 4),
         "public_pass_rate_pct": round(pub_rate, 2),
+        "sealed_pass_rate": round(seal_rate / 100.0, 4),
         "sealed_pass_rate_pct": round(seal_rate, 2),
+        "fidelity_verified_rate": round(fid_rate, 4),
+        "max_code_constraint_violation": max_code_viol,
         "false_confidence_count": false_conf_count,
         "zero_false_confidence": (false_conf_count == 0),
         "results": results,
     }
+
+
+def format_or_bench_report_table(summary: Dict[str, Any]) -> str:
+    """Formatea una tabla Markdown legible con el resultado detallado de los problemas de OR-Bench."""
+    lines = [
+        "| ID | Split | Clase | Estrategia | Estado Esperado | Estado Motor | J Motor | J Oráculo | Gap Rel | Fidelidad | Viol Código | Pasa |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in summary.get("results", []):
+        j_eng = f"{r['engine_objective']:.4f}" if isinstance(r.get("engine_objective"), (int, float)) else "-"
+        j_ora = f"{r['oracle_objective']:.4f}" if isinstance(r.get("oracle_objective"), (int, float)) else "-"
+        gap_s = f"{r['rel_optimality_gap']:.2e}" if isinstance(r.get("rel_optimality_gap"), (int, float)) else "-"
+        fid_s = "OK" if r.get("fidelity_verified") else "NO"
+        viol_s = f"{float(r.get('constraint_violation_on_code') or 0.0):.2e}"
+        ok_s = "PASS" if r.get("passed") else "FAIL"
+        lines.append(
+            f"| {r['id']} | {r['split']} | {r.get('problem_class') or '-'} | {r.get('strategy_used') or '-'} | "
+            f"{r['expected_status']} | {r['engine_status']} | {j_eng} | {j_ora} | {gap_s} | {fid_s} | {viol_s} | {ok_s} |"
+        )
+    return "\n".join(lines)
 
 
 __all__ = [
@@ -138,4 +179,5 @@ __all__ = [
     "get_all_or_bench_problems",
     "evaluate_single_or_problem",
     "evaluate_or_bench_suite",
+    "format_or_bench_report_table",
 ]

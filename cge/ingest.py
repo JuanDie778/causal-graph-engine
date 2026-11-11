@@ -601,8 +601,10 @@ class ASTIngestPipeline:
     _POS_LEDGER_METHODS = {"record_credit", "add_credit", "credit", "record_inflow", "inflow", "deposit"}
     _NEG_LEDGER_METHODS = {"record_debit", "add_debit", "debit", "record_outflow", "outflow", "withdraw"}
 
-    def __init__(self, target_dir: str):
+    def __init__(self, target_dir: str, entrypoint: Optional[str] = None, fidelity_samples: int = 24):
         self.target_dir = os.path.normpath(target_dir)
+        self.entrypoint = entrypoint
+        self.fidelity_samples = int(fidelity_samples)
         self.graph = CausalGraph(system_id="cge_ingested_system", version="1.1.0")
         self._symbols: Dict[str, sp.Symbol] = {}
         self._mechanisms: Dict[str, sp.Expr] = {}
@@ -703,6 +705,8 @@ class ASTIngestPipeline:
         global_mod_consts: Dict[str, Any] = {}
         all_constants: Dict[str, Dict[str, Any]] = {}
         bounds_map: Dict[str, Tuple[float, float]] = {}
+        domain_hints: Dict[str, str] = {}
+        target_hint: Optional[str] = None
         ceiling_constants: Dict[str, float] = {}
         has_conservation_class = False
         inferred_sense = str((cge_spec or {}).get("sense", "max")).lower()
@@ -719,6 +723,27 @@ class ASTIngestPipeline:
                 src_code = f.read()
             tree = ast.parse(src_code, filename=py_path)
             mod_consts: Dict[str, Any] = {}
+
+            # Extraer metadatos ligeros desde comentarios o docstrings (# bounds:, # domain:, # sense:, # target:)
+            for m_b in re.finditer(
+                r"(?:#|@)?\s*bounds\s*:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:in|=|:)?\s*[\[\(]\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*[\]\)]",
+                src_code,
+                flags=re.IGNORECASE,
+            ):
+                b_var = m_b.group(1).lower()
+                bounds_map[b_var] = (float(m_b.group(2)), float(m_b.group(3)))
+            for m_d in re.finditer(
+                r"(?:#|@)?\s*domain\s*:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:in|=|:)?\s*(integer|int|binary|bool|continuous|float)",
+                src_code,
+                flags=re.IGNORECASE,
+            ):
+                d_var = m_d.group(1).lower()
+                d_kind = m_d.group(2).lower()
+                domain_hints[d_var] = "binary" if d_kind in ("binary", "bool") else ("discrete" if d_kind in ("integer", "int") else "continuous")
+            for m_s in re.finditer(r"(?:#|@)\s*sense\s*:\s*(min|minimize|max|maximize)\b", src_code, flags=re.IGNORECASE):
+                inferred_sense = "min" if m_s.group(1).lower().startswith("min") else "max"
+            for m_t in re.finditer(r"(?:#|@)\s*target\s*:\s*([a-zA-Z_][a-zA-Z0-9_]*)\b", src_code, flags=re.IGNORECASE):
+                target_hint = m_t.group(1).strip()
 
             for stmt in tree.body:
                 t_name = None
@@ -919,7 +944,12 @@ class ASTIngestPipeline:
                     stoch_call = (c_attr, c)
                     break
 
-            if stoch_call is not None or fn_node.name.startswith("sample_"):
+            has_ctrl_param = any(
+                a.arg in bounds_map or a.arg in yaml_controls or a.arg.upper() in all_constants
+                for a in fn_node.args.args
+                if a.arg != "self"
+            )
+            if fn_node.name.startswith("sample_") or (stoch_call is not None and not has_ctrl_param and len(all_functions) > 1):
                 exogenous_fn_names.add(fn_node.name)
                 u_id = pipeline_call_to_var.get(fn_node.name) or self._strip_verb_prefix(fn_node.name)
                 mean_val = float(mod_consts.get(f"{u_id.upper()}_MEAN", 1000.0))
@@ -1099,7 +1129,9 @@ class ASTIngestPipeline:
                     def_val, ann_s, rel_file_p, l_range = param_defaults_map.get(
                         b_key, (None, None, parsed_modules[0][1] if parsed_modules else "model.py", [1, 1])
                     )
-                    is_int = (ann_s == "int") or (isinstance(def_val, int) and not isinstance(def_val, bool))
+                    d_hint = domain_hints.get(b_key)
+                    is_bool = (d_hint == "binary") or (ann_s == "bool") or isinstance(def_val, bool)
+                    is_int = is_bool or (d_hint == "discrete") or (ann_s == "int") or (isinstance(def_val, int) and not isinstance(def_val, bool))
                     if def_val is None or not isinstance(def_val, (int, float)):
                         mid = 0.5 * (b_tuple[0] + b_tuple[1])
                         def_val = int(round(mid)) if is_int else float(mid)
@@ -1113,7 +1145,7 @@ class ASTIngestPipeline:
                         id=b_key,
                         label=self._humanize_label(b_key, "control"),
                         category="control",
-                        data_type="discrete" if is_int else "continuous",
+                        data_type="boolean" if is_bool else ("discrete" if is_int else "continuous"),
                         source_reference=SourceReference(
                             file=rel_file_p,
                             entity=b_key.upper(),
@@ -1123,6 +1155,64 @@ class ASTIngestPipeline:
                         bounds=b_dict,
                         characteristic_scale=scale,
                     ))
+
+            # Soportar funciones Python puras sin constantes *_BOUNDS globales: registrar parámetros raíz como palancas
+            produced_node_names: Set[str] = set()
+            for _, _, fn_node_p, _, _ in all_functions:
+                if fn_node_p.name not in pipeline_fn_names:
+                    produced_node_names.add(pipeline_call_to_var.get(fn_node_p.name) or self._strip_verb_prefix(fn_node_p.name))
+                for sub_p in ast.walk(fn_node_p):
+                    if isinstance(sub_p, ast.Return) and isinstance(sub_p.value, ast.Dict):
+                        for k_node in sub_p.value.keys:
+                            if isinstance(k_node, ast.Constant) and isinstance(k_node.value, str):
+                                produced_node_names.add(k_node.value)
+
+            has_any_control = any(n.category == "control" for n in self.graph.nodes.values())
+            for p_key, (def_val, ann_s, rel_file_p, l_range) in param_defaults_map.items():
+                if p_key in self.graph.nodes or p_key in produced_node_names:
+                    continue
+                if not has_any_control or p_key in domain_hints:
+                    d_hint = domain_hints.get(p_key)
+                    is_bool = (d_hint == "binary") or (ann_s == "bool") or isinstance(def_val, bool)
+                    is_int = is_bool or (d_hint == "discrete") or (ann_s == "int") or (isinstance(def_val, int) and not isinstance(def_val, bool))
+                    if def_val is None or not isinstance(def_val, (int, float)):
+                        def_val = 0 if is_bool else (1 if is_int else 1.0)
+                    f_val = float(def_val)
+                    if is_bool:
+                        b_lo, b_hi = 0.0, 1.0
+                    elif f_val > 0.0:
+                        b_lo, b_hi = 0.0, max(10.0, f_val * 5.0)
+                    elif f_val < 0.0:
+                        b_lo, b_hi = min(-10.0, f_val * 5.0), abs(f_val) * 5.0 + 10.0
+                    else:
+                        b_lo, b_hi = (0.0, 100.0) if is_int else (-100.0, 100.0)
+                    b_dict = {
+                        "min": int(round(b_lo)) if is_int else float(b_lo),
+                        "max": int(round(b_hi)) if is_int else float(b_hi),
+                    }
+                    scale = float(b_hi - b_lo) if b_hi > b_lo else max(abs(f_val), 1.0)
+                    self._get_sym(p_key)
+                    self.graph.add_node(Node(
+                        id=p_key,
+                        label=self._humanize_label(p_key, "control"),
+                        category="control",
+                        data_type="boolean" if is_bool else ("discrete" if is_int else "continuous"),
+                        source_reference=SourceReference(
+                            file=rel_file_p,
+                            entity=p_key,
+                            line_range=l_range,
+                        ),
+                        current_value=int(round(f_val)) if is_int else float(f_val),
+                        bounds=b_dict,
+                        characteristic_scale=scale,
+                    ))
+
+            # Aplicar domain_hints explícitos a controles ya registrados
+            for d_key, d_kind in domain_hints.items():
+                if d_key in self.graph.nodes and self.graph.nodes[d_key].category == "control":
+                    self.graph.nodes[d_key].data_type = d_kind
+                    if d_kind == "binary":
+                        self.graph.nodes[d_key].bounds = {"min": 0, "max": 1}
 
         # 6. Clasificar el resto de funciones entre Optimizadores Locales (T4), Auxiliares (Helpers) y Mecanismos (V / J)
         candidate_fn_list = [
@@ -1173,8 +1263,10 @@ class ASTIngestPipeline:
 
             fn_params = [a.arg for a in fn_node.args.args if a.arg != "self"]
             # Detectar Optimizador Local (T4): sin argumentos del grafo causal y devuelve constante escalar
-            if not any(p in self.graph.nodes or p in all_param_names for p in fn_params) or len(fn_params) == 0 or (
-                len(fn_params) == 1 and fn_node.args.defaults and fn_params[0] not in self.graph.nodes
+            if len(all_functions) > 1 and fn_node.name != self.entrypoint and (
+                not any(p in self.graph.nodes or p in all_param_names for p in fn_params) or len(fn_params) == 0 or (
+                    len(fn_params) == 1 and fn_node.args.defaults and fn_params[0] not in self.graph.nodes
+                )
             ):
                 try:
                     comp_loc = ASTFunctionToSymPy({}, mod_consts, helper_ast_map)
@@ -1554,8 +1646,11 @@ class ASTIngestPipeline:
         if not sink_candidates:
             sink_candidates = list(mechanism_meta.keys())
 
-        if cge_spec and cge_spec.get("target") and (cge_spec["target"] in mechanism_meta or cge_spec["target"] in dag.nodes):
-            target_id = str(cge_spec["target"])
+        explicit_target = (cge_spec or {}).get("target") or target_hint
+        if explicit_target and (explicit_target in mechanism_meta or explicit_target in dag.nodes):
+            target_id = str(explicit_target)
+        elif explicit_target and self._strip_verb_prefix(str(explicit_target)) in mechanism_meta:
+            target_id = self._strip_verb_prefix(str(explicit_target))
         else:
             target_id = max(
                 sink_candidates,
@@ -1577,7 +1672,12 @@ class ASTIngestPipeline:
             if nid in self._mechanisms:
                 expr = self._mechanisms[nid]
                 subs_map = {self._symbols[k]: nominal_state[k] for k in nominal_state if k in self._symbols}
-                nominal_state[nid] = float(expr.evalf(subs=subs_map))
+                try:
+                    sym_keys = list(subs_map.keys())
+                    fn_lam = sp.lambdify(sym_keys, expr, modules="math")
+                    nominal_state[nid] = float(fn_lam(*[float(subs_map[s]) for s in sym_keys]))
+                except Exception:
+                    nominal_state[nid] = float(expr.xreplace({s: sp.Float(v) for s, v in subs_map.items()}).evalf())
             elif nid in self._blackbox_callables:
                 p_names, fn_call = self._blackbox_callables[nid]
                 args = [nominal_state[p] for p in p_names]
@@ -1785,7 +1885,12 @@ class ASTIngestPipeline:
 
         # 13. Fase 10 (Certificado 1): Verificar fidelidad punto a punto entre el código original y el CausalIR
         try:
-            certify_fidelity(self.graph, source_dir=self.target_dir)
+            certify_fidelity(
+                self.graph,
+                source_dir=self.target_dir,
+                entrypoint=self.entrypoint,
+                n_samples=self.fidelity_samples,
+            )
         except Exception:
             pass
 
@@ -2036,13 +2141,18 @@ def compile_source_to_ir(
     source_path_or_code: str,
     entrypoint: Optional[str] = None,
     cge_spec: Optional[Dict[str, Any]] = None,
+    system_id: Optional[str] = None,
 ) -> CausalGraph:
     """Compila un directorio, ruta de archivo .py o cadena de código Python a un CausalGraph con Certificado de Fidelidad."""
     import shutil
     import tempfile
 
     if os.path.isdir(source_path_or_code):
-        return ASTIngestPipeline(source_path_or_code).run()
+        graph = ASTIngestPipeline(source_path_or_code, entrypoint=entrypoint, fidelity_samples=64).run()
+        if system_id:
+            graph.system_id = system_id
+        graph.metadata["source_path"] = source_path_or_code
+        return graph
 
     tmp_dir = tempfile.mkdtemp(prefix="cge_src_compile_")
     try:
@@ -2054,14 +2164,18 @@ def compile_source_to_ir(
         if cge_spec:
             with open(os.path.join(tmp_dir, "cge.yaml"), "w", encoding="utf-8") as yf:
                 yaml.safe_dump(cge_spec, yf)
-        graph = ASTIngestPipeline(tmp_dir).run()
+        graph = ASTIngestPipeline(tmp_dir, entrypoint=entrypoint, fidelity_samples=64).run()
+        if system_id:
+            graph.system_id = system_id
         if not os.path.isfile(source_path_or_code):
             graph.metadata["inline_source_code"] = source_path_or_code
+            graph.metadata["source_code"] = source_path_or_code
             graph.metadata["target_dir"] = source_path_or_code
         else:
+            graph.metadata["source_path"] = source_path_or_code
             graph.metadata["target_dir"] = source_path_or_code
         if entrypoint:
-            certify_fidelity(graph, source_path_or_code=source_path_or_code, entrypoint=entrypoint)
+            graph.metadata["entrypoint"] = entrypoint
         return graph
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
