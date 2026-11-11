@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Any, List
 
@@ -29,6 +30,18 @@ GENERATE_MANIFEST_PY = ROOT_DIR / "benchmark" / "baseline_bench" / "generate_man
 REPORT_PY = ROOT_DIR / "benchmark" / "baseline_bench" / "report.py"
 MANIFEST_PATH = ROOT_DIR / "benchmark" / "baseline_bench" / "baseline_v0_manifest.json"
 SUMMARY_PATH = ROOT_DIR / "benchmark" / "baseline_bench" / "baseline_v0_summary.json"
+
+
+def _safe_write_bytes(target_file: Path, data: bytes, retries: int = 10) -> None:
+    """Safely write bytes on Windows handling transient file-locking."""
+    for attempt in range(retries):
+        try:
+            target_file.write_bytes(data)
+            return
+        except OSError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.05)
 
 
 def run_manifest_verify(manifest_file: Path | None = None) -> subprocess.CompletedProcess:
@@ -75,7 +88,7 @@ class TestManifestFileTamperResistance:
         try:
             # Perturb exactly 1 single byte (append a single space or mutate the last byte)
             tampered_bytes = original_bytes + b" "
-            target_file.write_bytes(tampered_bytes)
+            _safe_write_bytes(target_file, tampered_bytes)
 
             # Run verification
             proc = run_manifest_verify()
@@ -85,7 +98,7 @@ class TestManifestFileTamperResistance:
 
         finally:
             # Clean restoration guaranteed
-            target_file.write_bytes(original_bytes)
+            _safe_write_bytes(target_file, original_bytes)
 
         # Confirm post-restoration verification succeeds
         restore_proc = run_manifest_verify()
