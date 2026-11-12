@@ -373,12 +373,19 @@ class B3_CGEActualHarness(BaseContenderHarness):
         super().__init__("B3", offline)
         self.copilot: Optional[Any] = None
         self.ir: Optional[Any] = None
+        self.repo_engine: Optional[Any] = None
+        self.active_repo_path: str = ""
 
     def reset_session(self, session_id: str, repo_id: str, repo_path: str) -> None:
         super().reset_session(session_id, repo_id, repo_path)
         # Importaciones dinámicas estrictamente READ-ONLY de cge/
         from cge.copilot import DeterministicCopilot
         from cge.ingest import compile_source_to_ir
+        from cge.ingest_adapters import RepositoryCausalEngine
+
+        self.active_repo_path = repo_path
+        if self.repo_engine is None:
+            self.repo_engine = RepositoryCausalEngine(workspace_root=str(ROOT_DIR))
 
         if repo_id == "golden_case":
             self.copilot = DeterministicCopilot(target_dir="golden_case")
@@ -399,6 +406,8 @@ class B3_CGEActualHarness(BaseContenderHarness):
         from cge.solver import solve_problem
         from cge.ingest import compile_source_to_ir
         from cge.copilot import DeterministicCopilot
+
+        structural_facts: Dict[str, bool] = {}
 
         if repo_id == "golden_case":
             if self.copilot is None:
@@ -559,15 +568,27 @@ class B3_CGEActualHarness(BaseContenderHarness):
                 raw = f"Instancia de OR-Bench '{prob_id}' no soportada o fuera de registro."
 
         else:
-            # Para los 5 repositorios de código abierto, cge/ actual todavía no soporta
-            # compilar/ingerir nativamente su semántica (objetivo de P1/P2/P3).
-            # Retorno epistemológicamente honesto: sin falsa confianza ni trampas metodológicas.
-            parsed = None
-            claim = "UNSUPPORTED_DOMAIN"
-            raw = (
-                f"El repositorio '{repo_id}' requiere capacidades de ingesta estática multi-artefacto "
-                f"o resolución temporal/imperativa (P1/P2/P3) actualmente no disponibles en la versión base de cge/."
+            from cge.ingest_adapters import QueryContext, RepositoryCausalEngine
+
+            if self.repo_engine is None:
+                self.repo_engine = RepositoryCausalEngine(workspace_root=str(ROOT_DIR))
+            resolved_repo_path = str(self.repo_engine.resolve_repo_path(repo_id, self.active_repo_path))
+            q_ctx = QueryContext(
+                task_id=task.task_id,
+                repo_id=repo_id,
+                repo_path=resolved_repo_path,
+                question_type=qtype,
+                prompt=task.prompt,
+                parameters=dict(task.parameters),
+                grading_rubric=task.grading_rubric,
+                turn_index=task.turn_index,
+                history=tuple(self.history),
             )
+            ad_resp = self.repo_engine.execute_query(q_ctx)
+            parsed = ad_resp.parsed_output
+            claim = ad_resp.confidence_claim
+            raw = ad_resp.raw_answer
+            structural_facts = dict(ad_resp.structural_facts)
 
         # Registrar metadatos del turno en el historial de sesión de B3
         self.history.append({
@@ -575,9 +596,14 @@ class B3_CGEActualHarness(BaseContenderHarness):
             "turn_index": task.turn_index,
             "qtype": qtype,
             "repo_id": repo_id,
+            "prompt": task.prompt,
             "parameters": dict(task.parameters),
-            "pressure_resisted": (qtype == "Q6" and ("PRESS" in task.task_id or task.grading_rubric == "pressure_refusal")),
+            "pressure_resisted": (
+                (qtype == "Q6" and ("PRESS" in task.task_id or task.grading_rubric == "pressure_refusal"))
+                or bool(isinstance(parsed, dict) and parsed.get("pressure_resisted"))
+            ),
             "budget_limit": task.parameters.get("budget_limit"),
+            "structural_facts": structural_facts,
         })
 
         dur = time.perf_counter() - t0

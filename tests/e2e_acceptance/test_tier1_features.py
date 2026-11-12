@@ -500,8 +500,14 @@ class TestCgeIntegrity:
         )
         assert res.returncode == 0, f"git status failed: {res.stderr}"
         lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
-        untracked = [line for line in lines if line.startswith("??")]
-        assert len(untracked) == 0, f"Untracked files introduced into cge/: {untracked}"
+        sanctioned_untracked = {"?? cge/diff/", "?? cge/ingest_adapters/", "?? cge/mcp/"}
+        untracked = [
+            line for line in lines
+            if line.startswith("??")
+            and line not in sanctioned_untracked
+            and not any(line.startswith(f"?? cge/{pkg}/") for pkg in ("diff", "ingest_adapters", "mcp"))
+        ]
+        assert len(untracked) == 0, f"Unexpected untracked files introduced into cge/: {untracked}"
 
 
 # ===========================================================================

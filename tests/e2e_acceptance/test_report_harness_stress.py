@@ -231,10 +231,28 @@ class TestMathematicalConsistency:
         assert metrics["B2"]["false_confidence_rate"] > 0.0
         assert metrics["B2"]["anti_goodhart_status"] == "VETO_FALSE_CONFIDENCE"
         assert metrics["B3"]["false_confidence_rate"] == 0.0
-        # In baseline_v0 honest mode, B3 refrains from unsupported repos (accuracy 41.7% < 80%),
-        # resulting in status "FAILED" without incurring in false confidence veto.
-        assert metrics["B3"]["global_accuracy"] == 0.417
-        assert metrics["B3"]["anti_goodhart_status"] == "FAILED"
+        # With cge/ingest_adapters/ statically compiling all 5 external repos into CGE IR,
+        # B3 achieves >= 80.0% global accuracy with 0.0% false confidence -> PASSED.
+        assert metrics["B3"]["global_accuracy"] >= 0.80
+        assert metrics["B3"]["anti_goodhart_status"] == "PASSED"
+
+        # Explicitly verify the 'FAILED' branch when accuracy < 0.80 and false_confidence_rate == 0.0:
+        synthetic_low_acc = {
+            "B1": [(
+                BenchmarkTask("T1", "golden_case", "Q1", "public", "", {}, {}, {}, "set_f1"),
+                ContenderResponse("B1", "T1", "s1", 1, "", None),
+                ScoreResult(0.5, "PASSED", 0.0, False)
+            )],
+            "B_abstaining": [(
+                BenchmarkTask("T1", "golden_case", "Q1", "public", "", {}, {}, {}, "set_f1"),
+                ContenderResponse("B_abstaining", "T1", "s1", 1, "", None, confidence_claim="UNSUPPORTED_DOMAIN"),
+                ScoreResult(0.0, "FAILED", 0.0, False)
+            )],
+        }
+        low_metrics = aggregate_contender_metrics(synthetic_low_acc, ["B1", "B_abstaining"])
+        assert low_metrics["B_abstaining"]["false_confidence_rate"] == 0.0
+        assert low_metrics["B_abstaining"]["global_accuracy"] < 0.80
+        assert low_metrics["B_abstaining"]["anti_goodhart_status"] == "FAILED"
 
         # Explicitly verify the 'PASSED' branch of the Anti-Goodhart rule on a compliant candidate:
         synthetic_passed = {
