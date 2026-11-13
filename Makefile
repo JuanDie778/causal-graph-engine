@@ -1,35 +1,16 @@
-.PHONY: benchmark eval f1 oracle n0 n1 n2 n3 n4 n5 clean
+.PHONY: test or_bench fidelity ui clean
 
-benchmark:
-	python run_benchmark.py --level all
+test:
+	python -m pytest golden_case/tests/ benchmark/ -v
 
-eval:
-	python run_eval.py
+or_bench:
+	python -m pytest benchmark/test_n8_or_bench.py -v
 
-f1:
-	python -m pytest benchmark/test_f1_anti_memorization.py -v
+fidelity:
+	python -m pytest benchmark/test_f10_fidelity.py -v
 
-oracle:
-	python oracle/solve.py
-
-n0:
-	python run_benchmark.py --level N0
-
-n1:
-	python run_benchmark.py --level N1
-
-n2:
-	python run_benchmark.py --level N2
-
-n3:
-	python run_benchmark.py --level N3
-
-n4:
-	python run_benchmark.py --level N4
-
-n5:
-	python run_benchmark.py --level N5
+ui:
+	python run_ui.py golden_case
 
 clean:
-	python -c "import shutil, os; shutil.rmtree('benchmark_variants', ignore_errors=True)"
-
+	python -c "import shutil; shutil.rmtree('.pytest_cache', ignore_errors=True)"

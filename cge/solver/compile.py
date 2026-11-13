@@ -95,7 +95,7 @@ class Problem:
                 out[nid] = float(self.node_exprs_substituted[nid].evalf(subs=subs))
         return out
 
-    def max_constraint_violation(self, x_vec: np.ndarray) -> Tuple[float, Dict[str, float]]:
+    def max_constraint_violation(self, x_vec: np.ndarray, check_integrality: bool = True) -> Tuple[float, Dict[str, float]]:
         args = [float(v) for v in x_vec]
         viol_map: Dict[str, float] = {}
         max_v = 0.0
@@ -109,7 +109,7 @@ class Problem:
                 dv = val - v.ub
                 viol_map[f"bound_ub_{v.id}"] = dv
                 max_v = max(max_v, dv)
-            if v.domain in ("integer", "binary"):
+            if check_integrality and v.domain in ("integer", "binary"):
                 iv = abs(val - round(val))
                 if iv > 1e-6:
                     viol_map[f"integrality_{v.id}"] = iv
@@ -149,6 +149,21 @@ def _poly_degree(expr: sp.Expr, syms: List[sp.Symbol]) -> Optional[int]:
         return None
 
 
+def _strict_ineq_eps(lhs: sp.Expr, rhs: sp.Expr) -> sp.Float:
+    """Calcula un margen positivo invariante a escala para desigualdades estrictas continuas."""
+    scale = 1.0
+    for side in (lhs, rhs):
+        if side.is_number:
+            try:
+                v = abs(float(side.evalf()))
+                if v > 0.0:
+                    scale = v
+            except Exception:
+                pass
+    eps = min(1e-6, max(1e-11, 1e-6 * scale))
+    return sp.Float(eps)
+
+
 def _cond_to_ineqs_le_zero(cond: Any, discrete_syms: Optional[set] = None) -> List[sp.Expr]:
     """Convierte una condición relacional SymPy en una lista de desigualdades g(x) <= 0."""
     disc = discrete_syms or set()
@@ -162,14 +177,14 @@ def _cond_to_ineqs_le_zero(cond: Any, discrete_syms: Optional[set] = None) -> Li
         diff = cond.lhs - cond.rhs
         if diff.free_symbols and diff.free_symbols.issubset(disc):
             return [diff + sp.Integer(1)]
-        return [diff + sp.Float(1e-6)]
+        return [diff + _strict_ineq_eps(cond.lhs, cond.rhs)]
     if isinstance(cond, sp.GreaterThan):
         return [cond.rhs - cond.lhs]
     if isinstance(cond, sp.StrictGreaterThan):
         diff = cond.rhs - cond.lhs
         if diff.free_symbols and diff.free_symbols.issubset(disc):
             return [diff + sp.Integer(1)]
-        return [diff + sp.Float(1e-6)]
+        return [diff + _strict_ineq_eps(cond.lhs, cond.rhs)]
     if isinstance(cond, sp.Eq):
         return [cond.lhs - cond.rhs, cond.rhs - cond.lhs]
     if isinstance(cond, sp.And):
@@ -191,14 +206,14 @@ def _negate_cond_to_ineqs_le_zero(cond: Any, discrete_syms: Optional[set] = None
         diff = cond.rhs - cond.lhs
         if diff.free_symbols and diff.free_symbols.issubset(disc):
             return [diff + sp.Integer(1)]
-        return [diff + sp.Float(1e-6)]
+        return [diff + _strict_ineq_eps(cond.lhs, cond.rhs)]
     if isinstance(cond, sp.StrictLessThan):
         return [cond.rhs - cond.lhs]
     if isinstance(cond, sp.GreaterThan):
         diff = cond.lhs - cond.rhs
         if diff.free_symbols and diff.free_symbols.issubset(disc):
             return [diff + sp.Integer(1)]
-        return [diff + sp.Float(1e-6)]
+        return [diff + _strict_ineq_eps(cond.lhs, cond.rhs)]
     if isinstance(cond, sp.StrictGreaterThan):
         return [cond.lhs - cond.rhs]
     if isinstance(cond, sp.Not):

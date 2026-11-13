@@ -42,10 +42,19 @@ def _apply_atom_subs(expr: sp.Expr, ordered_subs: List[Tuple[sp.Expr, sp.Expr]])
     return out
 
 
+_LIN_COEFF_CACHE: Dict[Tuple[Any, ...], Optional[Tuple[np.ndarray, float]]] = {}
+
+
 def _extract_linear_coeffs(expr: sp.Expr, syms: List[sp.Symbol]) -> Optional[Tuple[np.ndarray, float]]:
     """Extrae vector a y escalar b tales que expr == a^T x + b, o None si no es lineal."""
+    key = (expr, tuple(syms))
+    if key in _LIN_COEFF_CACHE:
+        res = _LIN_COEFF_CACHE[key]
+        return (res[0].copy(), res[1]) if res is not None else None
     deg = _poly_degree(expr, syms)
     if deg is None or deg > 1:
+        if len(_LIN_COEFF_CACHE) < 4096:
+            _LIN_COEFF_CACHE[key] = None
         return None
     expanded = sp.expand(expr)
     coeffs = np.zeros(len(syms), dtype=float)
@@ -55,10 +64,16 @@ def _extract_linear_coeffs(expr: sp.Expr, syms: List[sp.Symbol]) -> Optional[Tup
         for i, s in enumerate(syms):
             d_s = sp.diff(expanded, s)
             if not d_s.is_number:
+                if len(_LIN_COEFF_CACHE) < 4096:
+                    _LIN_COEFF_CACHE[key] = None
                 return None
             coeffs[i] = float(d_s.evalf())
+        if len(_LIN_COEFF_CACHE) < 4096:
+            _LIN_COEFF_CACHE[key] = (coeffs.copy(), const_val)
         return coeffs, const_val
     except Exception:
+        if len(_LIN_COEFF_CACHE) < 4096:
+            _LIN_COEFF_CACHE[key] = None
         return None
 
 
@@ -214,7 +229,7 @@ def solve_strategy_a_piecewise_milp(problem: Problem) -> Optional[Dict[str, Any]
         ub_rows.append(1.0)
 
         # Estimar rango de las ramas del átomo r
-        br_parsed: List[Tuple[np.ndarray, float, List[Tuple[np.ndarray, float]]]] = []
+        br_parsed: List[Tuple[np.ndarray, float, float, float, List[Tuple[np.ndarray, float]]]] = []
         r_lo = 1e12
         r_hi = -1e12
 
@@ -247,42 +262,50 @@ def solve_strategy_a_piecewise_milp(problem: Problem) -> Optional[Dict[str, Any]
                     return None
                 cond_parsed.append(lin_gc)
 
-            br_parsed.append((vec_b, cst_b, cond_parsed))
+            br_parsed.append((vec_b, cst_b, float(b_min_v), float(b_max_v), cond_parsed))
 
         var_intervals.append((r_lo, r_hi))
-        lb_full[w_col] = r_lo - 1e3
-        ub_full[w_col] = r_hi + 1e3
-        big_m = max(2.5 * (r_hi - r_lo), 2.5 * max(abs(r_lo), abs(r_hi)), 5000.0) + 1000.0
+        w_margin = max(1e-6 * max(1.0, r_hi - r_lo), 1e-9)
+        lb_full[w_col] = r_lo - w_margin
+        ub_full[w_col] = r_hi + w_margin
 
-        for q, (vec_b, cst_b, cond_parsed) in enumerate(br_parsed):
+        for q, (vec_b, cst_b, b_min_v, b_max_v, cond_parsed) in enumerate(br_parsed):
             z_col = z_start + q
-            # 1) w_r - vec_b^T y + M * z_{r,q} <= M + cst_b
+            m_val_up = max(r_hi - b_min_v, 1e-7) * 1.05 + 1e-7
+            m_val_lo = max(b_max_v - r_lo, 1e-7) * 1.05 + 1e-7
+
+            # 1) w_r - vec_b^T y + M_up * z_{r,q} <= M_up + cst_b
             row1 = np.zeros(total_vars, dtype=float)
             row1[:n_ctrl + r] = -vec_b
             row1[w_col] = 1.0
-            row1[z_col] = big_m
+            row1[z_col] = m_val_up
             a_rows.append(row1)
             lb_rows.append(-np.inf)
-            ub_rows.append(big_m + cst_b)
+            ub_rows.append(m_val_up + cst_b)
 
-            # 2) -w_r + vec_b^T y + M * z_{r,q} <= M - cst_b
+            # 2) -w_r + vec_b^T y + M_lo * z_{r,q} <= M_lo - cst_b
             row2 = np.zeros(total_vars, dtype=float)
             row2[:n_ctrl + r] = vec_b
             row2[w_col] = -1.0
-            row2[z_col] = big_m
+            row2[z_col] = m_val_lo
             a_rows.append(row2)
             lb_rows.append(-np.inf)
-            ub_rows.append(big_m - cst_b)
+            ub_rows.append(m_val_lo - cst_b)
 
-            # 3) Condiciones de validez de rama: vec_gc^T y + cst_gc <= M * (1 - z_{r,q})
-            #    <=> vec_gc^T y + M * z_{r,q} <= M - cst_gc
+            # 3) Condiciones de validez de rama: vec_gc^T y + cst_gc <= M_cond * (1 - z_{r,q})
+            #    <=> vec_gc^T y + M_cond * z_{r,q} <= M_cond - cst_gc
             for vec_gc, cst_gc in cond_parsed:
+                gc_max_v = cst_gc
+                for j_idx, coeff_j in enumerate(vec_gc):
+                    v_lo, v_hi = var_intervals[j_idx]
+                    gc_max_v += coeff_j * v_hi if coeff_j >= 0 else coeff_j * v_lo
+                m_cond = max(gc_max_v, 1e-7) * 1.05 + 1e-7
                 row_c = np.zeros(total_vars, dtype=float)
                 row_c[:n_ctrl + r] = vec_gc
-                row_c[z_col] = big_m
+                row_c[z_col] = m_cond
                 a_rows.append(row_c)
                 lb_rows.append(-np.inf)
-                ub_rows.append(big_m - cst_gc + 1e-7)
+                ub_rows.append(m_cond - cst_gc + 1e-9 * max(1.0, m_cond))
 
     # Añadir las restricciones originales del problema en términos de [x, w]
     for tc_expr, tc_kind in top_constrs:
@@ -378,7 +401,7 @@ def _compute_kkt_stationarity_residual(
         return float(np.linalg.norm(grad_f))
     mat_a = np.column_stack(cols)
     try:
-        res_lsq = lsq_linear(mat_a, -grad_f, bounds=(0.0, np.inf))
+        res_lsq = lsq_linear(mat_a, -grad_f, bounds=(0.0, 1e12))
         return float(np.linalg.norm(grad_f + mat_a @ res_lsq.x))
     except Exception:
         return float(np.linalg.norm(grad_f))
@@ -654,12 +677,25 @@ def solve_strategy_b_regime_enumeration(
             else:
                 eq_reg.append(c_sub)
 
+        expanded_ineq_reg: List[sp.Expr] = []
+        pruned_contradictory = False
         for g_cand in raw_ineqs_all:
             g_exp = sp.expand(g_cand)
             if g_exp.is_number:
+                if float(g_exp.evalf()) > 1e-7:
+                    pruned_contradictory = True
+                    break
                 continue
-            if not any(sp.expand(g_exp - sp.expand(prev)) == 0 for prev in ineq_reg):
+            if any(sp.expand(g_exp + prev_e) == 0 for prev_e in expanded_ineq_reg):
+                # Dos átomos acoplados exigen g(x) <= 0 y -g(x) <= 0 simultáneamente; cubierto por el régimen compatible
+                pruned_contradictory = True
+                break
+            if not any(sp.expand(g_exp - prev_e) == 0 for prev_e in expanded_ineq_reg):
                 ineq_reg.append(g_cand)
+                expanded_ineq_reg.append(g_exp)
+
+        if pruned_contradictory:
+            continue
 
         # Propagación de cotas por intervalos sobre todas las desigualdades lineales del régimen
         lin_ineq_coeffs: List[Tuple[np.ndarray, float]] = []
@@ -702,26 +738,32 @@ def solve_strategy_b_regime_enumeration(
             if v_obj.domain in ("integer", "binary"):
                 pt_disc_lo[i_v] = reg_lb[i_v]
         reg_starts.append(pt_disc_lo)
-        for pt in base_starts[:max(4, n_starts // 2)]:
+        for pt in base_starts[:max(2, n_starts // 2)]:
             reg_starts.append(np.clip(pt, reg_lb, reg_ub))
 
         # 1) Resolver el subproblema suave del régimen
-        sub_res = _solve_smooth_subproblem_slsqp(f_reg, ineq_reg, eq_reg, ctrl_syms, reg_lb, reg_ub, reg_starts[:max(3, min(6, len(reg_starts)))])
+        sub_res = _solve_smooth_subproblem_slsqp(f_reg, ineq_reg, eq_reg, ctrl_syms, reg_lb, reg_ub, reg_starts[:max(2, min(4, len(reg_starts)))])
         candidates_in_regime: List[Tuple[np.ndarray, float, str]] = []
         if sub_res is not None:
             candidates_in_regime.append((sub_res[0], sub_res[2], "+".join(regime_labels) or "smooth_interior"))
 
-        # 2) Resolver sobre la variedad kink activa (donde a(x) == b(x) en átomos Min/Max)
-        base_kink_starts = ([sub_res[0]] if sub_res is not None else []) + reg_starts[:3]
+        # 2) Resolver sobre la variedad kink activa (donde a(x) == b(x) en átomos Min/Max presentes en el régimen)
+        base_kink_starts = ([sub_res[0]] if sub_res is not None else []) + reg_starts[:2]
+        seen_kink_exps: List[sp.Expr] = []
         for r_kink, kink_eqs in enumerate(kink_candidates_per_atom):
             if not kink_eqs:
                 continue
             kink_eq_sub = _apply_atom_subs(kink_eqs[0], atom_subs_list)
             kink_exp = sp.expand(kink_eq_sub)
             if not kink_exp.is_number:
+                if any(sp.expand(kink_exp - prev_k) == 0 or sp.expand(kink_exp + prev_k) == 0 for prev_k in seen_kink_exps):
+                    continue
+                if not any(sp.expand(e_exp - kink_exp) == 0 or sp.expand(e_exp + kink_exp) == 0 for e_exp in expanded_ineq_reg):
+                    continue
+                seen_kink_exps.append(kink_exp)
                 filtered_ineq = [
-                    e for e in ineq_reg
-                    if sp.expand(e - kink_exp) != 0 and sp.expand(e + kink_exp) != 0
+                    e for e, e_exp in zip(ineq_reg, expanded_ineq_reg)
+                    if sp.expand(e_exp - kink_exp) != 0 and sp.expand(e_exp + kink_exp) != 0
                 ]
                 # Proyectar puntos iniciales sobre la variedad kink si alguna variable entra linealmente
                 proj_starts: List[np.ndarray] = []
@@ -737,15 +779,15 @@ def solve_strategy_b_regime_enumeration(
                 if lin_var_idx is not None:
                     try:
                         k_fn, _ = _get_compiled_fn_and_grad(kink_eq_sub, ctrl_syms)
-                        for st_pt in base_kink_starts:
+                        for st_pt in base_kink_starts[:2]:
                             pt_c = st_pt.copy()
                             kv = float(k_fn(*[float(z) for z in pt_c]))
                             pt_c[lin_var_idx] = float(np.clip(pt_c[lin_var_idx] - kv / lin_slope, reg_lb[lin_var_idx], reg_ub[lin_var_idx]))
                             proj_starts.append(pt_c)
                     except Exception:
-                        proj_starts = list(base_kink_starts)
+                        proj_starts = list(base_kink_starts[:2])
                 else:
-                    proj_starts = list(base_kink_starts)
+                    proj_starts = list(base_kink_starts[:2])
 
                 kink_res = _solve_smooth_subproblem_slsqp(
                     f_reg,
@@ -760,7 +802,7 @@ def solve_strategy_b_regime_enumeration(
                     candidates_in_regime.append((kink_res[0], kink_res[2], f"{'+'.join(regime_labels)}+kink_{r_kink}"))
 
         for cand_x, cand_kkt, lbl in candidates_in_regime:
-            max_v, _ = problem.max_constraint_violation(cand_x)
+            max_v, _ = problem.max_constraint_violation(cand_x, check_integrality=False)
             if max_v <= 1e-4:
                 true_obj = eval_true_min_obj(cand_x)
                 all_regime_optima.append(cand_x.copy())
@@ -774,7 +816,7 @@ def solve_strategy_b_regime_enumeration(
     if best_x is None:
         return None
 
-    max_v, _ = problem.max_constraint_violation(best_x)
+    max_v, _ = problem.max_constraint_violation(best_x, check_integrality=False)
     return {
         "x": best_x,
         "j_val": best_j,
@@ -866,32 +908,39 @@ def solve_strategy_c_homotopy_lse(problem: Problem) -> Optional[Dict[str, Any]]:
             current_candidates = [stage_res[0]] + current_candidates[:2]
 
     best_x = current_candidates[0]
-    # Pulido exacto identificando la rama activa de cada átomo en best_x
+    # Pulido exacto identificando la rama activa de cada átomo en best_x junto con sus desigualdades de validez
     subs_best = {ctrl_syms[i]: float(best_x[i]) for i in range(n)}
     atom_subs_list: List[Tuple[sp.Expr, sp.Expr]] = []
+    pol_branch_ineqs: List[sp.Expr] = []
     for atom in problem.nonsmooth_atoms:
         best_br_expr = _apply_atom_subs(atom.branches[0][0], atom_subs_list)
+        best_br_conds = [_apply_atom_subs(gc, atom_subs_list) for gc in atom.branches[0][1]]
         for br_e, br_conds, _ in atom.branches:
             sub_conds = [_apply_atom_subs(gc, atom_subs_list) for gc in br_conds]
             try:
-                if all(float(sc.evalf(subs=subs_best)) <= 1e-5 for sc in sub_conds):
+                if all(float(sc.xreplace({s: sp.Float(v) for s, v in subs_best.items()}).evalf()) <= 1e-5 for sc in sub_conds):
                     best_br_expr = _apply_atom_subs(br_e, atom_subs_list)
+                    best_br_conds = sub_conds
                     break
             except Exception:
                 continue
         atom_subs_list.append((atom.sympy_atom, best_br_expr))
+        pol_branch_ineqs.extend(best_br_conds)
 
     f_pol = _apply_atom_subs(problem.min_obj_expr, atom_subs_list)
-    ineq_pol = [_apply_atom_subs(c.expr, atom_subs_list) for c in problem.constraints if c.kind == "ineq"]
+    ineq_pol = pol_branch_ineqs + [_apply_atom_subs(c.expr, atom_subs_list) for c in problem.constraints if c.kind == "ineq"]
     eq_pol = [_apply_atom_subs(c.expr, atom_subs_list) for c in problem.constraints if c.kind == "eq"]
     pol_res = _solve_smooth_subproblem_slsqp(f_pol, ineq_pol, eq_pol, ctrl_syms, lb, ub, [best_x])
     if pol_res is not None:
         cand_pol = pol_res[0]
-        v_pol, _ = problem.max_constraint_violation(cand_pol)
+        v_pol, _ = problem.max_constraint_violation(cand_pol, check_integrality=False)
         if v_pol <= 1e-4:
-            best_x = cand_pol
+            j_best = problem.evaluate_j(best_x)
+            j_cand = problem.evaluate_j(cand_pol)
+            if (problem.sense == "max" and j_cand >= j_best - 1e-7) or (problem.sense == "min" and j_cand <= j_best + 1e-7):
+                best_x = cand_pol
 
-    max_v, _ = problem.max_constraint_violation(best_x)
+    max_v, _ = problem.max_constraint_violation(best_x, check_integrality=False)
     if max_v > 1e-4:
         return None
 
@@ -977,7 +1026,7 @@ def solve_strategy_d_minlp(problem: Problem) -> Optional[Dict[str, Any]]:
 
     # Caso D2: MINLP mixto (variables discretas + continuas) o cardinalidad discreta moderada
     # Paso 1: Resolver la relajación continua en cada régimen suave + variedad kink
-    rel_sol = solve_strategy_b_regime_enumeration(problem, n_starts=6)
+    rel_sol = solve_strategy_b_regime_enumeration(problem, n_starts=3)
     if rel_sol is None and len(problem.nonsmooth_atoms) > 8:
         rel_sol = solve_strategy_c_homotopy_lse(problem)
 
@@ -991,7 +1040,7 @@ def solve_strategy_d_minlp(problem: Problem) -> Optional[Dict[str, Any]]:
         ranges = [range(int(round(problem.vars[i].lb)), int(round(problem.vars[i].ub)) + 1) for i in disc_indices]
         for combo in itertools.product(*ranges):
             fixed_map = {disc_indices[k]: float(combo[k]) for k in range(len(disc_indices))}
-            sub_sol = solve_strategy_b_regime_enumeration(problem, fixed_var_overrides=fixed_map, n_starts=3)
+            sub_sol = solve_strategy_b_regime_enumeration(problem, fixed_var_overrides=fixed_map, n_starts=2)
             if sub_sol is not None and sub_sol["max_violation"] <= 1e-4:
                 cand_x = sub_sol["x"]
                 for idx_d in disc_indices:
@@ -1002,16 +1051,15 @@ def solve_strategy_d_minlp(problem: Problem) -> Optional[Dict[str, Any]]:
                     best_int_x = cand_x.copy()
                     best_regime = sub_sol.get("active_regime", best_regime)
     else:
-        # Branch-and-Bound guiado por la relajación continua + vecindario entero alrededor de x_rel y umbrales
+        # Branch-and-Bound guiado por la relajación continua + vecindario entero alrededor de x_rel
         if rel_sol is not None:
             x_rel = rel_sol["x"]
             best_regime = rel_sol.get("active_regime", best_regime)
             reg_optima = rel_sol.get("all_regime_optima") or [x_rel]
-            node_map = problem.ir.nodes if isinstance(problem.ir.nodes, dict) else {nd.id: nd for nd in problem.ir.nodes}
 
             # 1) Evaluar redondeo rápido directo sobre todos los óptimos de régimen continuo
             for x_ro in reg_optima:
-                ro_rounds = [[math.floor(float(x_ro[idx_d])), math.ceil(float(x_ro[idx_d]))] for idx_d in disc_indices]
+                ro_rounds = [sorted({math.floor(float(x_ro[idx_d])), math.ceil(float(x_ro[idx_d]))}) for idx_d in disc_indices]
                 for r_combo in itertools.product(*ro_rounds):
                     cand_dir = x_ro.copy()
                     for k_i, idx_d in enumerate(disc_indices):
@@ -1024,33 +1072,30 @@ def solve_strategy_d_minlp(problem: Problem) -> Optional[Dict[str, Any]]:
                             best_int_f = f_dir
                             best_int_x = cand_dir.copy()
 
-            # 2) Re-optimizar variables continuas en los nodos enteros clave de Branch-and-Bound
-            disc_cand_sets: List[List[int]] = []
-            for idx_d in disc_indices:
-                v_d = problem.vars[idx_d]
-                lo_i, hi_i = int(round(v_d.lb)), int(round(v_d.ub))
-                val_r = float(x_rel[idx_d])
-                core_cands = {lo_i, hi_i, math.floor(val_r), math.ceil(val_r)}
-                for nd_obj in node_map.values():
-                    for dc in (nd_obj.discontinuities or []):
-                        if dc.get("variable") == v_d.id and "threshold" in dc:
-                            th_i = int(round(float(dc["threshold"])))
-                            core_cands.update([th_i - 1, th_i])
-                cands = sorted(set(max(lo_i, min(hi_i, int(c_v))) for c_v in core_cands))
-                disc_cand_sets.append(cands)
+            # 2) Si x_rel tiene parte fraccionaria en variables discretas, re-optimizar las continuas en floor/ceil
+            is_rel_already_int = all(abs(float(x_rel[idx_d]) - round(float(x_rel[idx_d]))) <= 1e-5 for idx_d in disc_indices)
+            if not is_rel_already_int or best_int_x is None:
+                disc_cand_sets: List[List[int]] = []
+                for idx_d in disc_indices:
+                    v_d = problem.vars[idx_d]
+                    lo_i, hi_i = int(round(v_d.lb)), int(round(v_d.ub))
+                    val_r = float(x_rel[idx_d])
+                    core_cands = {math.floor(val_r), math.ceil(val_r)}
+                    cands = sorted(set(max(lo_i, min(hi_i, int(c_v))) for c_v in core_cands))
+                    disc_cand_sets.append(cands)
 
-            for combo in itertools.product(*disc_cand_sets):
-                fixed_map = {disc_indices[k]: float(combo[k]) for k in range(len(disc_indices))}
-                sub_sol = solve_strategy_b_regime_enumeration(problem, fixed_var_overrides=fixed_map, n_starts=2)
-                if sub_sol is not None and sub_sol["max_violation"] <= 1e-4:
-                    cand_x = sub_sol["x"]
-                    for idx_d in disc_indices:
-                        cand_x[idx_d] = float(int(round(cand_x[idx_d])))
-                    f_v = eval_min_obj(cand_x)
-                    if f_v < best_int_f - 1e-9:
-                        best_int_f = f_v
-                        best_int_x = cand_x.copy()
-                        best_regime = sub_sol.get("active_regime", best_regime)
+                for combo in itertools.product(*disc_cand_sets):
+                    fixed_map = {disc_indices[k]: float(combo[k]) for k in range(len(disc_indices))}
+                    sub_sol = solve_strategy_b_regime_enumeration(problem, fixed_var_overrides=fixed_map, n_starts=2)
+                    if sub_sol is not None and sub_sol["max_violation"] <= 1e-4:
+                        cand_x = sub_sol["x"]
+                        for idx_d in disc_indices:
+                            cand_x[idx_d] = float(int(round(cand_x[idx_d])))
+                        f_v = eval_min_obj(cand_x)
+                        if f_v < best_int_f - 1e-9:
+                            best_int_f = f_v
+                            best_int_x = cand_x.copy()
+                            best_regime = sub_sol.get("active_regime", best_regime)
 
     if best_int_x is None:
         return None
@@ -1175,21 +1220,44 @@ def _test_subset_feasibility(problem: Problem, active_c_indices: List[int]) -> T
     best_x: Optional[np.ndarray] = None
     bounds_list = [(float(lb_v[i]), float(ub_v[i])) for i in range(n)]
 
-    for x0 in starts[:10]:
-        try:
-            res = minimize(penalty_fn, x0=x0, bounds=bounds_list, method="SLSQP", options={"ftol": 1e-9, "maxiter": 150})
-            cand_x = np.clip(np.array(res.x, dtype=float), lb_v, ub_v)
-            for i, v in enumerate(problem.vars):
-                if v.domain in ("integer", "binary"):
-                    cand_x[i] = float(int(round(cand_x[i])))
-            s_val = penalty_fn(cand_x)
-            if s_val < best_slack:
-                best_slack = s_val
-                best_x = cand_x
-            if best_slack <= 1e-7:
+    # Si todas las variables son discretas y el retículo entero es pequeño, evaluarlo exactamente
+    if all(v.domain in ("integer", "binary") for v in problem.vars):
+        card = 1
+        ranges: List[List[float]] = []
+        for v in problem.vars:
+            lo_i = int(math.ceil(v.lb))
+            hi_i = int(math.floor(v.ub))
+            span = max(0, hi_i - lo_i + 1)
+            card *= max(1, span)
+            if card > 4096:
                 break
-        except Exception:
-            continue
+            ranges.append([float(k) for k in range(lo_i, hi_i + 1)])
+        if card <= 4096 and len(ranges) == n and all(len(r) > 0 for r in ranges):
+            for pt in itertools.product(*ranges):
+                cand_x = np.array(pt, dtype=float)
+                s_val = penalty_fn(cand_x)
+                if s_val < best_slack:
+                    best_slack = s_val
+                    best_x = cand_x
+                if best_slack <= 1e-7:
+                    break
+
+    if best_slack > 1e-7:
+        for x0 in starts[:10]:
+            try:
+                res = minimize(penalty_fn, x0=x0, bounds=bounds_list, method="SLSQP", options={"ftol": 1e-9, "maxiter": 150})
+                cand_x = np.clip(np.array(res.x, dtype=float), lb_v, ub_v)
+                for i, v in enumerate(problem.vars):
+                    if v.domain in ("integer", "binary"):
+                        cand_x[i] = float(int(round(cand_x[i])))
+                s_val = penalty_fn(cand_x)
+                if s_val < best_slack:
+                    best_slack = s_val
+                    best_x = cand_x
+                if best_slack <= 1e-7:
+                    break
+            except Exception:
+                continue
 
     slack_map: Dict[str, float] = {}
     if best_x is not None:
@@ -1225,7 +1293,7 @@ def solve_strategy_e_iis(problem: Problem) -> Dict[str, Any]:
                 "active_regime": "elastic_feasible",
             }
 
-    # Filtro de eliminación (Deletion Filter) para aislar el Subsistema Irreduciblemente Inconsistente (IIS)
+    # Filtro de eliminación (Deletion Filter) para aislar un Subsistema Irreduciblemente Inconsistente (IIS)
     iis_indices = list(all_indices)
     for idx_c in list(all_indices):
         trial_indices = [i for i in iis_indices if i != idx_c]
@@ -1233,6 +1301,23 @@ def solve_strategy_e_iis(problem: Problem) -> Dict[str, Any]:
         # Si al quitar idx_c el sistema SIGUE siendo infactible, idx_c es redundante para el conflicto
         if not sub_feas:
             iis_indices = trial_indices
+
+    # Si hay pocos candidatos totales y el IIS hallado tiene cardinalidad > 1, verificar si existe un IIS
+    # de cardinalidad estrictamente menor (cuando existen múltiples IIS solapados)
+    if len(iis_indices) > 1 and len(all_indices) <= 12:
+        found_smaller = False
+        for r_size in range(1, len(iis_indices)):
+            if math.comb(len(all_indices), r_size) > 84:
+                break
+            for comb in itertools.combinations(all_indices, r_size):
+                comb_list = list(comb)
+                sub_feas_c, _, _, _ = _test_subset_feasibility(problem, comb_list)
+                if not sub_feas_c:
+                    iis_indices = comb_list
+                    found_smaller = True
+                    break
+            if found_smaller:
+                break
 
     iis_ids = [problem.constraints[i].id for i in iis_indices]
 

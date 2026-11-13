@@ -24,3 +24,6 @@ temp/
 
 # Benchmark temporary variants
 benchmark_variants/
+
+# Swarm agent temporary artifacts
+.agents/

@@ -182,6 +182,36 @@ def _analyze_static_purity(
 
         param_names = {a.arg for a in fn_node.args.args}
         local_assigned: Set[str] = set(param_names)
+        param_tainted: Set[str] = set(param_names)
+
+        def _extract_ref_keys(expr_node: ast.AST) -> Set[str]:
+            keys: Set[str] = set()
+            for n in ast.walk(expr_node):
+                if isinstance(n, ast.Name):
+                    keys.add(n.id)
+                elif (
+                    isinstance(n, ast.Subscript)
+                    and isinstance(n.value, ast.Name)
+                    and isinstance(n.slice, ast.Constant)
+                ):
+                    keys.add(f"{n.value.id}[{n.slice.value!r}]")
+            return keys
+
+        def _extract_target_keys(tgt_node: ast.AST) -> Set[str]:
+            keys: Set[str] = set()
+            if isinstance(tgt_node, ast.Name):
+                keys.add(tgt_node.id)
+            elif (
+                isinstance(tgt_node, ast.Subscript)
+                and isinstance(tgt_node.value, ast.Name)
+                and isinstance(tgt_node.slice, ast.Constant)
+            ):
+                keys.add(f"{tgt_node.value.id}[{tgt_node.slice.value!r}]")
+            elif isinstance(tgt_node, (ast.Tuple, ast.List)):
+                for elt in tgt_node.elts:
+                    keys.update(_extract_target_keys(elt))
+            return keys
+
         for sub in ast.walk(fn_node):
             if isinstance(sub, ast.Assign):
                 for t in sub.targets:
@@ -196,6 +226,20 @@ def _analyze_static_purity(
             elif isinstance(sub, ast.For) and isinstance(sub.target, ast.Name):
                 local_assigned.add(sub.target.id)
 
+        # Propagación de contaminación desde parámetros de entrada hacia variables locales (punto fijo)
+        for _ in range(3):
+            for sub in ast.walk(fn_node):
+                if isinstance(sub, ast.Assign) and sub.value is not None:
+                    if _extract_ref_keys(sub.value) & param_tainted:
+                        for t in sub.targets:
+                            param_tainted.update(_extract_target_keys(t))
+                elif isinstance(sub, (ast.AnnAssign, ast.AugAssign)) and sub.value is not None:
+                    if _extract_ref_keys(sub.value) & param_tainted:
+                        param_tainted.update(_extract_target_keys(sub.target))
+                elif isinstance(sub, ast.For):
+                    if _extract_ref_keys(sub.iter) & param_tainted:
+                        param_tainted.update(_extract_target_keys(sub.target))
+
         has_local_seeded_rng = False
         for sub in ast.walk(fn_node):
             if isinstance(sub, ast.Call):
@@ -208,6 +252,26 @@ def _analyze_static_purity(
             if isinstance(sub, (ast.Global, ast.Nonlocal)):
                 fn_direct_issues[fn_name] = f"EXTERNAL_STATE_MUTATION: función '{fn_name}' declara estado global/nonlocal mutable."
                 break
+            if isinstance(sub, ast.For):
+                if _extract_ref_keys(sub.iter) & param_tainted:
+                    fn_direct_issues[fn_name] = (
+                        f"UNSUPPORTED_DYNAMIC_LOOP: función '{fn_name}' contiene un bucle for cuyo número de iteraciones "
+                        f"depende dinámicamente de las variables de entrada."
+                    )
+                    break
+            if isinstance(sub, ast.While):
+                cond_keys = _extract_ref_keys(sub.test)
+                for body_node in ast.walk(sub):
+                    if isinstance(body_node, ast.If):
+                        has_exit = any(isinstance(x, (ast.Break, ast.Return)) for x in ast.walk(body_node))
+                        if has_exit:
+                            cond_keys.update(_extract_ref_keys(body_node.test))
+                if cond_keys & param_tainted:
+                    fn_direct_issues[fn_name] = (
+                        f"UNSUPPORTED_DYNAMIC_LOOP: función '{fn_name}' contiene un bucle while cuya condición de parada "
+                        f"depende dinámicamente de las variables de entrada."
+                    )
+                    break
             if isinstance(sub, (ast.Import, ast.ImportFrom)):
                 mods = [alias.name.split(".")[0] for alias in sub.names]
                 if isinstance(sub, ast.ImportFrom) and sub.module:
@@ -278,8 +342,8 @@ def _analyze_static_purity(
 
 
 def _needs_subprocess_timeout_guard(files_code: List[Tuple[str, str]], static_issues: Dict[str, str]) -> bool:
-    """Determina si el código requiere subproceso aislado con timeout (p. ej. recursión no acotada)."""
-    if any("UNSUPPORTED_RECURSION" in v for v in static_issues.values()):
+    """Determina si el código requiere subproceso aislado con timeout (p. ej. recursión o bucles dinámicos no acotados)."""
+    if any("UNSUPPORTED_RECURSION" in v or "UNSUPPORTED_DYNAMIC_LOOP" in v for v in static_issues.values()):
         return True
     return False
 
@@ -315,6 +379,33 @@ def _execute_traced_samples_isolated(
         def visit_Assert(self, node: ast.Assert) -> ast.AST:
             if self.strip_asserts:
                 return ast.Pass()
+            if isinstance(node.test, ast.Compare) and len(node.test.ops) == 1 and len(node.test.comparators) == 1:
+                op = node.test.ops[0]
+                lhs = node.test.left
+                rhs = node.test.comparators[0]
+                tol = ast.Constant(value=1e-6)
+                if isinstance(op, (ast.LtE, ast.Lt)):
+                    new_test = ast.Compare(
+                        left=lhs,
+                        ops=[ast.LtE()],
+                        comparators=[ast.BinOp(left=rhs, op=ast.Add(), right=tol)],
+                    )
+                    return ast.copy_location(ast.Assert(test=new_test, msg=node.msg), node)
+                if isinstance(op, (ast.GtE, ast.Gt)):
+                    new_test = ast.Compare(
+                        left=lhs,
+                        ops=[ast.GtE()],
+                        comparators=[ast.BinOp(left=rhs, op=ast.Sub(), right=tol)],
+                    )
+                    return ast.copy_location(ast.Assert(test=new_test, msg=node.msg), node)
+                if isinstance(op, ast.Eq):
+                    diff_abs = ast.Call(
+                        func=ast.Name(id="abs", ctx=ast.Load()),
+                        args=[ast.BinOp(left=lhs, op=ast.Sub(), right=rhs)],
+                        keywords=[],
+                    )
+                    new_test = ast.Compare(left=diff_abs, ops=[ast.LtE()], comparators=[tol])
+                    return ast.copy_location(ast.Assert(test=new_test, msg=node.msg), node)
             return node
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> Any:
@@ -781,7 +872,15 @@ def certify_fidelity(
     """Certificado 1: Ejecuta el código original en un subproceso aislado sobre n_samples entradas Sobol
     y verifica nodo a nodo que el CausalIR coincide con el código real con error relativo <= rel_tol.
     """
-    src_target = source_path_or_code or source_dir or (ir.metadata or {}).get("target_dir")
+    meta = ir.metadata or {}
+    src_target = (
+        source_path_or_code
+        or source_dir
+        or meta.get("source_code")
+        or meta.get("inline_source_code")
+        or meta.get("source_path")
+        or meta.get("target_dir")
+    )
     files_code, _ = _collect_source_files(src_target)
 
     dag = nx.DiGraph()
@@ -1094,7 +1193,14 @@ def evaluate_recipe_on_source(
     """Certificado 3: Ejecuta la receta ganadora X* directamente sobre el código fuente original
     (manteniendo los asserts activos) y verifica que todas las restricciones duras se cumplen en el código real.
     """
-    src_target = source_path_or_code or (ir.metadata or {}).get("target_dir")
+    meta = ir.metadata or {}
+    src_target = (
+        source_path_or_code
+        or meta.get("source_code")
+        or meta.get("inline_source_code")
+        or meta.get("source_path")
+        or meta.get("target_dir")
+    )
     files_code, _ = _collect_source_files(src_target)
 
     sample_input: Dict[str, float] = {}

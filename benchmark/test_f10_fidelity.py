@@ -118,6 +118,32 @@ def f_qp(w1: float = 0.5, w2: float = 0.5) -> float:
     assert sol_qp["controls"]["w1"] == pytest.approx(0.75, abs=1e-3)
     assert sol_qp["controls"]["w2"] == pytest.approx(0.25, abs=1e-3)
 
+    # 3. NLP_NONSMOOTH con K = 9 > 8 átomos no suaves (Estrategia C: Homotopía LSE)
+    lse_ir = compile_source_to_ir('''
+SENSE = "max"
+U1: float = 5.0
+U2: float = 5.0
+U1_BOUNDS = (0.0, 20.0)
+U2_BOUNDS = (0.0, 20.0)
+CONSTRAINTS = {"c_sum": "u1 + u2 <= 24.0"}
+def f_many_atoms(u1: float = 5.0, u2: float = 5.0) -> float:
+    s = (
+        min(u1, 10.0) + min(u2, 10.0)
+        + min(u1 + u2, 18.0) + min(2.0 * u1, 22.0)
+        + min(2.0 * u2, 22.0) + min(u1 + 2.0 * u2, 30.0)
+        + min(2.0 * u1 + u2, 30.0) + min(3.0 * u1, 33.0)
+        + min(3.0 * u2, 33.0) - 0.05 * (u1 ** 2 + u2 ** 2)
+    )
+    return s
+''', entrypoint="f_many_atoms")
+    prob_lse = compile_problem(lse_ir)
+    assert prob_lse.problem_class == "NLP_NONSMOOTH"
+    assert len(prob_lse.nonsmooth_atoms) >= 9
+    sol_lse = solve_problem(lse_ir)
+    assert sol_lse["status"] == "OPTIMAL"
+    assert sol_lse["strategy_used"] == "strategy_c_lse_homotopy"
+    assert sol_lse["objective_value"] == pytest.approx(195.9, abs=1e-2)
+
 
 def test_f10_4_epistemic_honesty_gate_end_to_end():
     """Verifica que cuando la fidelidad falla, Layer2Solver, DeterministicCopilot y /api/optimize devuelven UNSUPPORTED."""
@@ -184,3 +210,97 @@ def evaluate_guarded_process(a_val: float = 5.0, b_val: float = 5.0) -> float:
     assert sol["certificate"]["code_verified"] is True
     assert sol["certificate"]["constraint_violation_on_code"] == 0.0
     assert sol["controls"]["a_val"] + sol["controls"]["b_val"] <= 15.0 + 1e-5
+
+
+def test_f10_6_dynamic_loops_comment_hints_piecewise_bigm_and_overlapping_iis():
+    """Verifica detección de bucles dependientes de datos, hints en comentarios, Big-M invariante a escala e IIS mínimo."""
+    from cge.solver.strategies import solve_strategy_a_piecewise_milp
+
+    # 1. Bucle for/while cuyo número de iteraciones depende de la entrada -> UNSUPPORTED
+    dyn_loop_code = '''
+SENSE = "max"
+X_IN: float = 50.0
+X_IN_BOUNDS = (1.0, 200.0)
+
+def compute_dyn_loop(x_in: float = 50.0) -> float:
+    acc = 0.0
+    for i in range(int(x_in)):
+        acc += 1.0
+    return acc
+'''
+    ir_loop = compile_source_to_ir(dyn_loop_code, entrypoint="compute_dyn_loop")
+    fid_rep = ir_loop.metadata.get("fidelity_report", {})
+    assert fid_rep.get("verified") is False
+    assert fid_rep.get("n_samples") == 64
+    sol_loop = solve_problem(ir_loop)
+    assert sol_loop["status"] == "UNSUPPORTED"
+    assert "UNSUPPORTED_DYNAMIC_LOOP" in (sol_loop.get("reason") or "")
+
+    # 2. Big-M invariante a escala en Strategy A Piecewise MILP (dominio grande [0, 50000] y dominio micro [0, 1e-5])
+    pw_large_code = '''
+SENSE = "max"
+QTY: int = 5000
+QTY_BOUNDS = (0, 50000)
+
+def compute_rebate_score(qty: int = 5000) -> float:
+    rebate = 0.0 if qty < 10000 else 500.0
+    return 2.0 * qty + rebate
+'''
+    ir_pw_large = compile_source_to_ir(pw_large_code, entrypoint="compute_rebate_score")
+    prob_pw_large = compile_problem(ir_pw_large)
+    sol_pw_large = solve_strategy_a_piecewise_milp(prob_pw_large)
+    assert sol_pw_large is not None
+    assert sol_pw_large["j_val"] == pytest.approx(100500.0, rel=1e-6)
+
+    pw_micro_code = '''
+SENSE = "max"
+U_MICRO: float = 2e-6
+U_MICRO_BOUNDS = (0.0, 1e-5)
+
+def compute_micro_piecewise(u_micro: float = 2e-6) -> float:
+    val = u_micro if u_micro <= 5e-6 else 5e-6 - 2.0 * (u_micro - 5e-6)
+    return val
+'''
+    ir_pw_micro = compile_source_to_ir(pw_micro_code, entrypoint="compute_micro_piecewise")
+    sol_pw_micro = solve_problem(ir_pw_micro)
+    assert sol_pw_micro["status"] == "OPTIMAL"
+    assert sol_pw_micro["objective_value"] == pytest.approx(5e-6, rel=1e-3)
+
+    # 3. Función Python pura con hints en comentarios (# sense:, # bounds:, # domain:) y sin constantes globales *_BOUNDS
+    hint_code = '''
+# sense: max
+# bounds: x_int in [0, 10]
+# domain: x_int = integer
+# bounds: y_cont in [0.0, 8.0]
+def evaluate_hinted_fn(x_int: int = 2, y_cont: float = 1.5) -> float:
+    return -(x_int - 7) ** 2 - (y_cont - 4.25) ** 2 + 100.0
+'''
+    ir_hint = compile_source_to_ir(hint_code, entrypoint="evaluate_hinted_fn")
+    sol_hint = solve_problem(ir_hint)
+    assert sol_hint["status"] == "OPTIMAL"
+    assert sol_hint["controls"]["x_int"] == 7
+    assert sol_hint["controls"]["y_cont"] == pytest.approx(4.25, abs=1e-3)
+    assert sol_hint["objective_value"] == pytest.approx(100.0, abs=1e-3)
+
+    # 4. Selección de IIS de cardinalidad mínima ante conflictos solapados ({c1, c2} de tamaño 2 vs {c2, c3, c4} de tamaño 3)
+    iis_overlap_code = '''
+SENSE = "max"
+X1: float = 5.0
+X2: float = 5.0
+X1_BOUNDS = (0.0, 20.0)
+X2_BOUNDS = (0.0, 20.0)
+CONSTRAINTS = {
+    "c1_pair": "x1 >= 12.0",
+    "c2_shared": "x1 <= 8.0",
+    "c3_triple_a": "x2 >= 10.0",
+    "c4_triple_b": "x1 + x2 >= 20.0",
+}
+def compute_iis_overlap(x1: float = 5.0, x2: float = 5.0) -> float:
+    return x1 + x2
+'''
+    ir_iis = compile_source_to_ir(iis_overlap_code, entrypoint="compute_iis_overlap")
+    sol_iis = solve_problem(ir_iis)
+    assert sol_iis["status"] == "INFEASIBLE"
+    assert sol_iis["certificate_status"] == "INFEASIBLE_CERTIFIED"
+    assert set(sol_iis["iis_constraints"]) == {"c1_pair", "c2_shared"}
+
