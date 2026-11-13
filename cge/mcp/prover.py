@@ -2899,13 +2899,38 @@ def _prove_single_expression(
         and control_sym_set
     ):
         inv_leaf_syms: Set[sp.Basic] = set()
+        ant_ctrl_coupled = False
         for cl in cnf_clauses:
             for a_iq in cl.antecedents:
-                inv_leaf_syms |= a_iq.expr.xreplace(subs_leaf).free_symbols
+                a_lf = a_iq.expr.xreplace(subs_leaf)
+                inv_leaf_syms |= a_lf.free_symbols
+                if a_lf.free_symbols & control_sym_set:
+                    ant_ctrl_coupled = True
             for q_iq in cl.consequents:
                 inv_leaf_syms |= q_iq.expr.xreplace(subs_leaf).free_symbols
 
-        if (inv_leaf_syms & exo_sym_set) and (inv_leaf_syms & control_sym_set):
+        if not ant_ctrl_coupled and (inv_leaf_syms & exo_sym_set) and (inv_leaf_syms & control_sym_set):
+            first_ants = []
+            for a_iq in cnf_clauses[0].antecedents:
+                a_lf0 = a_iq.expr.xreplace(subs_leaf)
+                fs_a0 = sorted(str(s) for s in a_lf0.free_symbols)
+                fn_a0 = sp.lambdify([syms[s] for s in fs_a0], a_lf0, modules=safe_mods)
+                first_ants.append((a_iq, fs_a0, fn_a0))
+
+            def _ants_hold_at(st_map: Dict[str, float]) -> bool:
+                for a_iq, fs_a0, fn_a0 in first_ants:
+                    av = float(fn_a0(*[st_map[s] for s in fs_a0]))
+                    if not math.isfinite(av):
+                        return False
+                    if a_iq.strict:
+                        if not (av < -1e-12):
+                            return False
+                    else:
+                        tol_a = 1e-11 if "==" in a_iq.raw else 1e-12
+                        if not (av <= tol_a):
+                            return False
+                return True
+
             # Construir conjunto candidato de shocks U: esquinas + punto medio + Sobol QMC + máximo interior adversario
             exo_cands: List[Dict[str, float]] = []
             exo_mid = {uid: 0.5 * (bounds_map[uid][0] + bounds_map[uid][1]) for uid in varying_exo_ids}
@@ -2947,6 +2972,13 @@ def _prove_single_expression(
                     u_map = dict(exo_mid)
                     for idx_u, uid in enumerate(cont_exo):
                         u_map[uid] = float(u_vec[idx_u])
+                    if first_ants:
+                        try:
+                            full_u = _eval_full_state({**nom_pt, **u_map})
+                            if not _ants_hold_at(full_u):
+                                return 0.0
+                        except Exception:
+                            return 0.0
                     best_x_v = math.inf
                     for xp in ctrl_probes:
                         merged = dict(nom_pt)
@@ -2974,6 +3006,12 @@ def _prove_single_expression(
             # Filtrar shocks sospechosos donde ningún control de sondeo satisface la propiedad y certificar con `solve_problem`
             suspicious_shocks: List[Tuple[float, Dict[str, float]]] = []
             for u_cand in exo_cands:
+                if first_ants:
+                    try:
+                        if not _ants_hold_at(_eval_full_state({**nom_pt, **u_cand})):
+                            continue
+                    except Exception:
+                        continue
                 min_v = math.inf
                 for xp in ctrl_probes:
                     merged = dict(nom_pt)
@@ -2997,18 +3035,25 @@ def _prove_single_expression(
                             wit_leaf = dict(nom_pt)
                             wit_leaf.update(u_cand)
                             full_wit = _eval_full_state(wit_leaf)
-                            viol_mag = float(sol_exo.get("min_relaxation_slack") or 1.0)
-                            return _build_falsified_response(
-                                invariant_expr,
-                                constraint_id_label,
-                                {
-                                    "counterexample_inputs": {k: full_wit[k] for k in leaf_ids},
-                                    "evaluated_state": full_wit,
-                                    "violated_clause": cnf_clauses[0].consequents[0].raw,
-                                    "violation_magnitude": max(1e-6, viol_mag),
-                                },
-                                "exogenous_shock_unrealizability",
+                            q0_val = float(fn_fq(*[full_wit[s] for s in fq_syms]))
+                            q0_violated = (
+                                (q0_val >= -1e-12)
+                                if cnf_clauses[0].consequents[0].strict
+                                else (q0_val > 1e-12)
                             )
+                            if _ants_hold_at(full_wit) and q0_violated:
+                                viol_mag = float(sol_exo.get("min_relaxation_slack") or 1.0)
+                                return _build_falsified_response(
+                                    invariant_expr,
+                                    constraint_id_label,
+                                    {
+                                        "counterexample_inputs": {k: full_wit[k] for k in leaf_ids},
+                                        "evaluated_state": full_wit,
+                                        "violated_clause": cnf_clauses[0].consequents[0].raw,
+                                        "violation_magnitude": max(1e-6, viol_mag),
+                                    },
+                                    "exogenous_shock_unrealizability",
+                                )
                 except Exception:
                     pass
 

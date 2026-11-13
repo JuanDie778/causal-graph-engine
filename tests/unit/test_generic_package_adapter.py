@@ -694,6 +694,19 @@ class TestFourLiveAuditRefinements:
         assert pr_fals["counterexample"]["seats"] >= 81.0
         assert float(pr_fals["counterexample"]["seats"]).is_integer()
 
+        pr_gov_imp = oracle.prove(
+            source_path="examples/saas_governed",
+            invariant_expr=(
+                "seats >= 50 and seat_price >= 80 and annual_discount <= 0.10 "
+                "and sla_reserve_rate <= 0.02 => net_operating_margin >= 600.0"
+            ),
+        )
+        assert pr_gov_imp["status"] == "PROVEN"
+        assert pr_gov_imp["seal"] == "PROVEN"
+
+        pr_gov_full = oracle.prove(source_path="examples/saas_governed")
+        assert pr_gov_full["status"] == "FALSIFIED"
+
     def test_refinement_4_relative_source_path_from_external_cwd_over_stdio(self, tmp_path: Path):
         async def _external_cwd_scenario() -> None:
             env = {**os.environ, "PYTHONUTF8": "1", "PYTHONPATH": str(WORKSPACE_ROOT)}
