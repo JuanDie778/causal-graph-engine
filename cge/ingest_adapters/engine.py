@@ -8,12 +8,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
 
 from ..schema import CausalGraph
-from .base import AdapterResponse, QueryContext
+from .base import AdapterResponse, QueryContext, StaticRepoASTExtractor
 from .dispatch_adapter import DispatchCausalAdapter
 from .epidemiology_adapter import EpidemiologyCausalAdapter
+from .generic_adapter import ActorDBSidecarSpec, GenericPackageAdapter
 from .loan_tax_adapter import LoanTaxCausalAdapter
 from .quantecon_adapter import QuantEconCausalAdapter
 from .supplychain_adapter import SupplyChainCausalAdapter
+
+GENERIC_PACKAGE_REPO_ID = "__generic_package__"
+_LEGACY_BOUNDS_MARKER_RE = re.compile(r"^[A-Z][A-Z0-9_]*_BOUNDS\s*(?::[^=]+)?=", re.MULTILINE)
 
 
 def _compute_repo_fs_signature(repo_dir: Path) -> str:
@@ -108,9 +112,53 @@ class RepositoryCausalEngine:
         return (self.workspace_root / "benchmark" / "baseline_bench" / "repos" / repo_id).resolve()
 
     def supports(self, repo_id: str) -> bool:
-        return repo_id in self.ADAPTER_REGISTRY
+        return repo_id in self.ADAPTER_REGISTRY or repo_id == GENERIC_PACKAGE_REPO_ID
+
+    def _is_generic_python_package_dir(self, dir_p: Path) -> bool:
+        """Determina si `dir_p` es un paquete Python multi-módulo elegible para `GenericPackageAdapter`
+        respetando compatibilidad total con `golden_case` y fixtures legacy de `ASTIngestPipeline`.
+        """
+        if not dir_p.exists() or not dir_p.is_dir():
+            return False
+        if ActorDBSidecarSpec.find_sidecar_file(dir_p) is not None:
+            return True
+        if dir_p == self.workspace_root or (dir_p / "cge").is_dir() or dir_p.name == "golden_case":
+            return False
+        if any(dir_p.rglob("*.csv")):
+            return False
+
+        domain_py = [
+            p
+            for p in dir_p.rglob("*.py")
+            if "__pycache__" not in p.parts
+            and p.name != "__init__.py"
+            and not StaticRepoASTExtractor._is_test_module(p, dir_p)
+        ]
+        if len(domain_py) < 2:
+            return False
+
+        for py_p in domain_py:
+            try:
+                txt = py_p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if _LEGACY_BOUNDS_MARKER_RE.search(txt):
+                return False
+        return True
 
     def get_adapter(self, repo_id: str, repo_path: Optional[str] = None) -> Optional[Any]:
+        if repo_id == GENERIC_PACKAGE_REPO_ID:
+            if not repo_path:
+                return None
+            resolved_gen = Path(repo_path).resolve()
+            fs_sig_gen = _compute_repo_fs_signature(resolved_gen)
+            cache_key_gen = f"{GENERIC_PACKAGE_REPO_ID}::{resolved_gen.as_posix()}::{fs_sig_gen}"
+            if cache_key_gen not in self._adapter_cache:
+                if len(self._adapter_cache) >= 64:
+                    self._adapter_cache.clear()
+                self._adapter_cache[cache_key_gen] = GenericPackageAdapter(str(resolved_gen))
+            return self._adapter_cache[cache_key_gen]
+
         adapter_cls = self.ADAPTER_REGISTRY.get(repo_id)
         if adapter_cls is None:
             return None
@@ -126,29 +174,38 @@ class RepositoryCausalEngine:
     def resolve_adapter_source(self, source: str) -> Optional[Dict[str, Any]]:
         """Interpreta `source_path` si apunta a un repositorio/módulo/submodelo gestionado por `ingest_adapters`.
 
-        Acepta:
-        - `repo_id` directo (ej. `"supplychainpy_mini"`)
-        - `repo_id:submodel` o `adapter://repo_id[:submodel]` (ej. `"quantecon_cournot_solow:cournot"`)
-        - Ruta a directorio del repositorio o copia temporal en disco (con o sin `:submodel`)
-        - Ruta a archivo `.py` individual dentro de un repositorio soportado (infiriendo submodelo por módulo)
+        Prioridades deterministas:
+        1. `ADAPTER_REGISTRY` (5 repositorios especializados de referencia).
+        2. Esquema `generic://<ruta>[:submodel]` o directorio con sidecar `actordb.yaml`/`actordb.yml`/`actordb.json`.
+        3. Paquete Python multi-módulo (`>= 2` módulos de dominio sin marcadores legacy CSV/`*_BOUNDS`).
 
-        Retorna `None` cuando `source` no pertenece a ningún repositorio adaptador (delegando en `cge/ingest.py`).
+        Retorna `None` cuando `source` debe delegarse al pipeline legacy `cge/ingest.py`.
         """
         s = (source or "").strip()
         if not s or "\n" in s:
             return None
 
-        has_scheme = False
+        has_adapter_scheme = False
+        has_generic_scheme = False
         body = s
         if body.lower().startswith("adapter://"):
-            has_scheme = True
+            has_adapter_scheme = True
             body = body[len("adapter://"):].strip()
             if not body:
                 return {
                     "error_code": "INVALID_SOURCE",
                     "message": "Adapter URI 'adapter://' is missing repository identifier.",
                 }
+        elif body.lower().startswith("generic://"):
+            has_generic_scheme = True
+            body = body[len("generic://"):].strip()
+            if not body:
+                return {
+                    "error_code": "INVALID_SOURCE",
+                    "message": "Generic package URI 'generic://' is missing target directory path.",
+                }
 
+        has_scheme = has_adapter_scheme or has_generic_scheme
         base_str = body
         explicit_submodel: Optional[str] = None
 
@@ -164,7 +221,7 @@ class RepositoryCausalEngine:
                 base_str = left_clean
                 explicit_submodel = right_clean
 
-        if base_str in self.ADAPTER_REGISTRY:
+        if not has_generic_scheme and base_str in self.ADAPTER_REGISTRY:
             repo_dir = self.resolve_repo_path(base_str)
             if not repo_dir.exists() or not repo_dir.is_dir():
                 return {
@@ -176,49 +233,86 @@ class RepositoryCausalEngine:
                 "repo_dir": repo_dir,
                 "explicit_submodel": explicit_submodel,
                 "file_hint": None,
+                "is_generic_package": False,
                 "fs_signature": _compute_repo_fs_signature(repo_dir),
             }
 
         if os.path.isdir(base_str):
             dir_p = Path(base_str).resolve()
-            det_id = self.detect_repo_id_for_dir(dir_p)
-            if det_id is None:
-                if has_scheme:
+            if not has_generic_scheme:
+                det_id = self.detect_repo_id_for_dir(dir_p)
+                if det_id is not None:
                     return {
-                        "error_code": "UNSUPPORTED_ADAPTER_REPO",
-                        "message": (
-                            f"Directory '{base_str}' does not match any registered adapter repository: "
-                            f"{sorted(self.ADAPTER_REGISTRY.keys())}."
-                        ),
+                        "repo_id": det_id,
+                        "repo_dir": dir_p,
+                        "explicit_submodel": explicit_submodel,
+                        "file_hint": None,
+                        "is_generic_package": False,
+                        "fs_signature": _compute_repo_fs_signature(dir_p),
                     }
-                return None
-            return {
-                "repo_id": det_id,
-                "repo_dir": dir_p,
-                "explicit_submodel": explicit_submodel,
-                "file_hint": None,
-                "fs_signature": _compute_repo_fs_signature(dir_p),
-            }
+
+            if has_generic_scheme or self._is_generic_python_package_dir(dir_p):
+                return {
+                    "repo_id": GENERIC_PACKAGE_REPO_ID,
+                    "repo_dir": dir_p,
+                    "explicit_submodel": explicit_submodel,
+                    "file_hint": None,
+                    "is_generic_package": True,
+                    "fs_signature": _compute_repo_fs_signature(dir_p),
+                }
+
+            if has_adapter_scheme:
+                return {
+                    "error_code": "UNSUPPORTED_ADAPTER_REPO",
+                    "message": (
+                        f"Directory '{base_str}' does not match any registered adapter repository: "
+                        f"{sorted(self.ADAPTER_REGISTRY.keys())}."
+                    ),
+                }
+            return None
 
         if os.path.isfile(base_str) and base_str.lower().endswith(".py"):
             file_p = Path(base_str).resolve()
-            det_id = self.detect_repo_id_for_dir(file_p.parent)
-            if det_id is None:
-                if has_scheme:
+            if not has_generic_scheme:
+                det_id = self.detect_repo_id_for_dir(file_p.parent)
+                if det_id is not None:
                     return {
-                        "error_code": "UNSUPPORTED_ADAPTER_REPO",
-                        "message": f"Python module '{base_str}' does not belong to any registered adapter repository.",
+                        "repo_id": det_id,
+                        "repo_dir": file_p.parent,
+                        "explicit_submodel": explicit_submodel,
+                        "file_hint": file_p.name,
+                        "is_generic_package": False,
+                        "fs_signature": _compute_repo_fs_signature(file_p.parent),
                     }
-                return None
+
+            # Si el módulo pertenece a un paquete con sidecar `actordb.yaml` (en su carpeta o padre directo)
+            for cand_pkg in (file_p.parent, file_p.parent.parent):
+                if cand_pkg == self.workspace_root or not cand_pkg.exists():
+                    break
+                if has_generic_scheme or ActorDBSidecarSpec.find_sidecar_file(cand_pkg) is not None:
+                    return {
+                        "repo_id": GENERIC_PACKAGE_REPO_ID,
+                        "repo_dir": cand_pkg,
+                        "explicit_submodel": explicit_submodel,
+                        "file_hint": file_p.name,
+                        "is_generic_package": True,
+                        "fs_signature": _compute_repo_fs_signature(cand_pkg),
+                    }
+
+            if has_adapter_scheme:
+                return {
+                    "error_code": "UNSUPPORTED_ADAPTER_REPO",
+                    "message": f"Python module '{base_str}' does not belong to any registered adapter repository.",
+                }
+            return None
+
+        if has_generic_scheme:
             return {
-                "repo_id": det_id,
-                "repo_dir": file_p.parent,
-                "explicit_submodel": explicit_submodel,
-                "file_hint": file_p.name,
-                "fs_signature": _compute_repo_fs_signature(file_p.parent),
+                "error_code": "SOURCE_NOT_FOUND",
+                "message": f"Generic package path '{base_str}' does not exist on disk.",
             }
 
-        if has_scheme:
+        if has_adapter_scheme:
             return {
                 "error_code": "UNSUPPORTED_ADAPTER_REPO",
                 "message": (

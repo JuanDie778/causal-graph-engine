@@ -95,9 +95,11 @@ SERVER_INSTRUCTIONS = (
     "`cge_do` to execute Pearlian counterfactual interventions do(X=x) with graph surgery; "
     "`cge_solve` to compute certified optimal policies under hard constraints (or Minimal IIS if infeasible); "
     "and `cge_prove` to formally verify invariants (`PROVEN`, `SAMPLED_VERIFIED`, or `FALSIFIED` with exact counterexample). "
-    "`source_path` accepts adapter repo IDs (e.g. `supplychainpy_mini`, `economic_dispatch`, `loan_tax_engine`, "
-    "`quantecon_cournot_solow`, `epidemiology_seir`), explicit `:submodel` selectors (e.g. `quantecon_cournot_solow:cournot`), "
-    "repository directories, `.py` modules, JSON IR files, or inline Python source."
+    "`source_path` accepts any multi-module Python package directory (with optional `actordb.yaml` declarative sidecar "
+    "or `generic://<dir>[:submodel]`), specialized adapter IDs (`supplychainpy_mini`, `economic_dispatch`, "
+    "`loan_tax_engine`, `quantecon_cournot_solow`, `epidemiology_seir`), `:submodel` selectors, `.py` modules, "
+    "JSON IR files, or inline Python source. On zero-config packages without `actordb.yaml`, pass "
+    "`modifiable_controls` (and optional `control_bounds`) to `cge_solve` to specify decision levers without hallucination."
 )
 
 
@@ -172,7 +174,9 @@ def create_mcp_server(
         description=(
             "Compute a certified optimal control policy (LP, MILP, QP, NLP, MINLP) subject to all hard constraints "
             "and Epistemic Honesty Gate. Returns CERTIFIED_OPTIMAL/BEST_FOUND recipes, INFEASIBLE_CERTIFIED with "
-            "Minimal Irreducible Inconsistent Subsystem (IIS) and KKT shadow multipliers, or UNSUPPORTED."
+            "Minimal Irreducible Inconsistent Subsystem (IIS) and KKT shadow multipliers, or UNSUPPORTED. "
+            "On zero-config Python packages without `actordb.yaml`, pass `modifiable_controls` (and optional "
+            "`control_bounds`) to specify which leaf inputs are decision levers."
         ),
     )
     async def cge_solve(
@@ -181,6 +185,8 @@ def create_mcp_server(
         target_value: Optional[float] = None,
         fixed_controls: Optional[Dict[str, float]] = None,
         exo_overrides: Optional[Dict[str, float]] = None,
+        modifiable_controls: Optional[List[str]] = None,
+        control_bounds: Optional[Dict[str, List[float]]] = None,
         ignore_constraints: bool = False,
         source_path: Optional[str] = None,
         graph_data: Optional[Dict[str, Any]] = None,
@@ -192,6 +198,8 @@ def create_mcp_server(
                 target_value=target_value,
                 fixed_controls=fixed_controls,
                 exo_overrides=exo_overrides,
+                modifiable_controls=modifiable_controls,
+                control_bounds=control_bounds,
                 ignore_constraints=ignore_constraints,
                 source_path=source_path,
                 graph_data=graph_data,
@@ -274,6 +282,8 @@ def cge_solve(
     target_value: Optional[float] = None,
     fixed_controls: Optional[Dict[str, float]] = None,
     exo_overrides: Optional[Dict[str, float]] = None,
+    modifiable_controls: Optional[List[str]] = None,
+    control_bounds: Optional[Dict[str, List[float]]] = None,
     ignore_constraints: bool = False,
     source_path: Optional[str] = None,
     graph_data: Optional[Dict[str, Any]] = None,
@@ -284,6 +294,8 @@ def cge_solve(
         target_value=target_value,
         fixed_controls=fixed_controls,
         exo_overrides=exo_overrides,
+        modifiable_controls=modifiable_controls,
+        control_bounds=control_bounds,
         ignore_constraints=ignore_constraints,
         source_path=source_path,
         graph_data=graph_data,

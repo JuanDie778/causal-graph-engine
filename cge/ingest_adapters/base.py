@@ -54,6 +54,8 @@ class ExtractedFunctionSpec:
     sympy_expr: Optional[Any] = None
     precondition_bounds: Dict[str, Tuple[Optional[float], Optional[float]]] = field(default_factory=dict)
     discontinuities: List[Dict[str, Any]] = field(default_factory=list)
+    guard_constraints: List[Dict[str, Any]] = field(default_factory=list)
+    assert_constraints: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -72,14 +74,18 @@ class ExtractedClassSpec:
 class StaticRepoASTExtractor:
     """Extractor estático puro (sin ejecutar código arbitrario) sobre todos los módulos de un repositorio."""
 
-    def __init__(self, repo_path: str):
+    def __init__(self, repo_path: str, exclude_tests: bool = False):
         self.repo_path = Path(repo_path).resolve()
+        self.exclude_tests = bool(exclude_tests)
         self.functions: Dict[str, ExtractedFunctionSpec] = {}
         self.classes: Dict[str, ExtractedClassSpec] = {}
         self.module_constants: Dict[str, Any] = {}
+        self.per_module_constants: Dict[str, Dict[str, Any]] = {}
         self.constant_locations: Dict[str, Tuple[str, int]] = {}
         self.markdown_docs: Dict[str, str] = {}
         self._helper_ast_map: Dict[str, Tuple[ast.FunctionDef, Dict[str, Any]]] = {}
+        self._helper_defaults_map: Dict[str, Dict[str, Any]] = {}
+        self.call_graph: Dict[str, Set[str]] = {}
 
     @staticmethod
     def _eval_static_literal(node: ast.AST, local_consts: Optional[Dict[str, Any]] = None) -> Tuple[bool, Any]:
@@ -200,7 +206,109 @@ class StaticRepoASTExtractor:
                         elif isinstance(op, ast.Gt):
                             _set_ub(lhs.id, v, strict=False)
 
+        for stmt in fn_node.body:
+            if not isinstance(stmt, ast.Assert):
+                continue
+            conjuncts: List[ast.AST] = []
+            if isinstance(stmt.test, ast.BoolOp) and isinstance(stmt.test.op, ast.And):
+                conjuncts.extend(stmt.test.values)
+            else:
+                conjuncts.append(stmt.test)
+            for c_item in conjuncts:
+                if isinstance(c_item, ast.Compare):
+                    operands = [c_item.left] + list(c_item.comparators)
+                    for i, op in enumerate(c_item.ops):
+                        lhs, rhs = operands[i], operands[i + 1]
+                        if isinstance(lhs, ast.Constant) and isinstance(lhs.value, (int, float)) and isinstance(rhs, ast.Name):
+                            if isinstance(op, ast.Lt):
+                                _set_lb(rhs.id, float(lhs.value), strict=True)
+                            elif isinstance(op, ast.LtE):
+                                _set_lb(rhs.id, float(lhs.value), strict=False)
+                        elif isinstance(lhs, ast.Name) and isinstance(rhs, ast.Constant) and isinstance(rhs.value, (int, float)):
+                            if isinstance(op, ast.Lt):
+                                _set_ub(lhs.id, float(rhs.value), strict=True)
+                            elif isinstance(op, ast.LtE):
+                                _set_ub(lhs.id, float(rhs.value), strict=False)
+                            elif isinstance(op, ast.Gt):
+                                _set_lb(lhs.id, float(rhs.value), strict=True)
+                            elif isinstance(op, ast.GtE):
+                                _set_lb(lhs.id, float(rhs.value), strict=False)
+
         return {k: (v[0], v[1]) for k, v in bounds.items()}
+
+    @staticmethod
+    def _extract_guard_constraints(
+        fn_node: ast.FunctionDef,
+        mod_consts: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Deduce restricciones relacionales multi-variable de `if <cond>: raise ValueError`."""
+        consts = mod_consts or {}
+        out: List[Dict[str, Any]] = []
+
+        def _render_simple_expr(node: ast.AST) -> Optional[str]:
+            if isinstance(node, ast.Name):
+                if node.id in consts and isinstance(consts[node.id], (int, float)) and not isinstance(consts[node.id], bool):
+                    return repr(float(consts[node.id]))
+                return node.id
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+                return repr(float(node.value))
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+                sub = _render_simple_expr(node.operand)
+                return f"(-{sub})" if sub is not None else None
+            if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+                lv = _render_simple_expr(node.left)
+                rv = _render_simple_expr(node.right)
+                if lv is None or rv is None:
+                    return None
+                op_sym = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}[type(node.op)]
+                return f"({lv} {op_sym} {rv})"
+            return None
+
+        for idx_s, stmt in enumerate(fn_node.body):
+            if not isinstance(stmt, ast.If) or stmt.orelse:
+                continue
+            if not all(isinstance(b, ast.Raise) for b in stmt.body):
+                continue
+            disjuncts: List[ast.AST] = []
+            if isinstance(stmt.test, ast.BoolOp) and isinstance(stmt.test.op, ast.Or):
+                disjuncts.extend(stmt.test.values)
+            elif isinstance(stmt.test, ast.Compare):
+                disjuncts.append(stmt.test)
+
+            msg_txt = ""
+            if stmt.body and isinstance(stmt.body[0], ast.Raise) and isinstance(stmt.body[0].exc, ast.Call):
+                exc_call = stmt.body[0].exc
+                if exc_call.args and isinstance(exc_call.args[0], ast.Constant) and isinstance(exc_call.args[0].value, str):
+                    msg_txt = exc_call.args[0].value.strip()
+
+            for d_idx, d in enumerate(disjuncts):
+                if not isinstance(d, ast.Compare) or len(d.ops) != 1 or len(d.comparators) != 1:
+                    continue
+                lhs_n, op, rhs_n = d.left, d.ops[0], d.comparators[0]
+                # Omitir cotas simples de una sola variable contra literal (ya cubiertas en `precondition_bounds`)
+                if (isinstance(lhs_n, ast.Name) and isinstance(rhs_n, ast.Constant)) or (
+                    isinstance(lhs_n, ast.Constant) and isinstance(rhs_n, ast.Name)
+                ):
+                    continue
+                ls = _render_simple_expr(lhs_n)
+                rs = _render_simple_expr(rhs_n)
+                if ls is None or rs is None:
+                    continue
+                # Si `if A > B: raise` => invariante válido `A <= B`
+                if isinstance(op, (ast.Gt, ast.GtE)):
+                    expr_str = f"{ls} <= {rs}"
+                elif isinstance(op, (ast.Lt, ast.LtE)):
+                    expr_str = f"{ls} >= {rs}"
+                else:
+                    continue
+                out.append({
+                    "id": f"c_guard_{fn_node.name}_{idx_s + 1}_{d_idx + 1}",
+                    "expression": expr_str,
+                    "description": msg_txt or f"Precondición de guarda en {fn_node.name} (línea {getattr(stmt, 'lineno', 1)})",
+                    "lineno": getattr(stmt, "lineno", 1),
+                })
+
+        return out
 
     @staticmethod
     def _strip_raise_guards(stmts: List[ast.stmt]) -> List[ast.stmt]:
@@ -212,6 +320,18 @@ class StaticRepoASTExtractor:
             cleaned.append(s)
         return cleaned
 
+    @staticmethod
+    def _is_test_module(py_path: Path, repo_root: Path) -> bool:
+        rel_parts = py_path.relative_to(repo_root).parts
+        if any(pt in ("tests", "test", ".pytest_cache", "venv", ".venv") for pt in rel_parts[:-1]):
+            return True
+        fname = py_path.name.lower()
+        return (
+            fname.startswith("test_")
+            or fname.endswith("_test.py")
+            or fname in ("conftest.py", "setup.py")
+        )
+
     def extract(self) -> "StaticRepoASTExtractor":
         if not self.repo_path.exists():
             raise FileNotFoundError(f"Repositorio no encontrado: {self.repo_path}")
@@ -222,12 +342,16 @@ class StaticRepoASTExtractor:
 
         py_files = sorted(
             p for p in self.repo_path.rglob("*.py")
-            if "__pycache__" not in p.parts and p.name != "__init__.py"
+            if "__pycache__" not in p.parts
+            and p.name != "__init__.py"
+            and not (self.exclude_tests and self._is_test_module(p, self.repo_path))
         )
 
-        parsed_modules: List[Tuple[str, ast.Module, Dict[str, Any]]] = []
+        raw_modules: List[Tuple[Path, str, str, ast.Module, Dict[str, Any]]] = []
         for py_path in py_files:
-            rel_file = f"{self.repo_path.name}/{py_path.relative_to(self.repo_path).as_posix()}"
+            rel_sub = py_path.relative_to(self.repo_path).as_posix()
+            rel_file = f"{self.repo_path.name}/{rel_sub}"
+            mod_key = rel_sub[:-3].replace("/", ".")
             src = py_path.read_text(encoding="utf-8")
             tree = ast.parse(src, filename=str(py_path))
             mod_consts: Dict[str, Any] = {}
@@ -249,6 +373,45 @@ class StaticRepoASTExtractor:
                         self.module_constants[t_name] = lit_val
                         self.constant_locations[t_name] = (rel_file, getattr(stmt, "lineno", 1))
 
+            self.per_module_constants[mod_key] = mod_consts
+            self.per_module_constants[py_path.stem] = mod_consts
+            raw_modules.append((py_path, rel_file, mod_key, tree, mod_consts))
+
+        # Paso 1b: Resolver constantes importadas cross-módulo y registrar funciones auxiliares
+        parsed_modules: List[Tuple[str, ast.Module, Dict[str, Any], Dict[str, str]]] = []
+        for _py_path, rel_file, _mod_key, tree, mod_consts in raw_modules:
+            fn_aliases: Dict[str, str] = {}
+            for stmt in tree.body:
+                if isinstance(stmt, ast.ImportFrom):
+                    target_mod = (stmt.module or "").split(".")[-1]
+                    src_consts = self.per_module_constants.get(target_mod, self.module_constants)
+                    for alias in stmt.names:
+                        orig = alias.name
+                        as_id = alias.asname or orig
+                        if orig in src_consts:
+                            mod_consts[as_id] = src_consts[orig]
+                        elif orig in self.module_constants:
+                            mod_consts[as_id] = self.module_constants[orig]
+                        else:
+                            fn_aliases[as_id] = orig
+
+            # Re-evaluar constantes del módulo que dependían de constantes importadas de otro módulo
+            for stmt in tree.body:
+                t_name2: Optional[str] = None
+                val_node2: Optional[ast.AST] = None
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                    t_name2 = stmt.targets[0].id
+                    val_node2 = stmt.value
+                elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                    t_name2 = stmt.target.id
+                    val_node2 = stmt.value
+                if t_name2 and t_name2 not in mod_consts and val_node2 is not None:
+                    ok2, lit_val2 = self._eval_static_literal(val_node2, {**self.module_constants, **mod_consts})
+                    if ok2:
+                        mod_consts[t_name2] = lit_val2
+                        self.module_constants[t_name2] = lit_val2
+                        self.constant_locations[t_name2] = (rel_file, getattr(stmt, "lineno", 1))
+
             for stmt in tree.body:
                 if isinstance(stmt, ast.FunctionDef):
                     clean_fn = ast.FunctionDef(
@@ -260,13 +423,41 @@ class StaticRepoASTExtractor:
                         lineno=stmt.lineno,
                     )
                     self._helper_ast_map[stmt.name] = (clean_fn, dict(mod_consts))
+                    h_defs: Dict[str, Any] = {}
+                    n_hd = len(stmt.args.defaults)
+                    if n_hd > 0:
+                        h_args = [a.arg for a in stmt.args.args]
+                        for an, dn in zip(h_args[-n_hd:], stmt.args.defaults, strict=False):
+                            ok_d, vd = self._eval_static_literal(dn, {**self.module_constants, **mod_consts})
+                            if ok_d:
+                                h_defs[an] = vd
+                    self._helper_defaults_map[stmt.name] = h_defs
 
-            parsed_modules.append((rel_file, tree, mod_consts))
+            parsed_modules.append((rel_file, tree, mod_consts, fn_aliases))
 
-        # Segunda pasada: compilar funciones y métodos de clase a SymPy cuando pertenezcan al subconjunto simbólico
-        for rel_file, tree, mod_consts in parsed_modules:
+        # Registrar alias de funciones importadas (`from .costs import compute_fee as cf`)
+        for _rel_file, _tree, _mod_consts, fn_aliases in parsed_modules:
+            for as_id, orig in fn_aliases.items():
+                if as_id != orig and orig in self._helper_ast_map and as_id not in self._helper_ast_map:
+                    self._helper_ast_map[as_id] = self._helper_ast_map[orig]
+                    self._helper_defaults_map[as_id] = dict(self._helper_defaults_map.get(orig, {}))
+
+        # Segunda pasada: compilar funciones, registrar grafo de llamadas internas y métodos de clase
+        known_fn_names = set(self._helper_ast_map.keys())
+        for rel_file, tree, mod_consts, fn_aliases in parsed_modules:
             for stmt in tree.body:
                 if isinstance(stmt, ast.FunctionDef):
+                    callees: Set[str] = set()
+                    for sub_n in ast.walk(stmt):
+                        if isinstance(sub_n, ast.Call):
+                            cname: Optional[str] = None
+                            if isinstance(sub_n.func, ast.Name):
+                                cname = fn_aliases.get(sub_n.func.id, sub_n.func.id)
+                            elif isinstance(sub_n.func, ast.Attribute):
+                                cname = sub_n.func.attr
+                            if cname and cname in known_fn_names and cname != stmt.name:
+                                callees.add(cname)
+                    self.call_graph[stmt.name] = callees
                     spec = self._build_function_spec(stmt, rel_file, mod_consts)
                     self.functions[stmt.name] = spec
                 elif isinstance(stmt, ast.ClassDef):
@@ -293,20 +484,23 @@ class StaticRepoASTExtractor:
 
         doc = ast.get_docstring(fn_node) or ""
         guard_bounds = self._extract_guard_bounds(fn_node)
+        guard_constrs = self._extract_guard_constraints(fn_node, {**self.module_constants, **mod_consts})
 
         sym_expr: Optional[Any] = None
         discs: List[Dict[str, Any]] = []
+        assert_constrs: List[Dict[str, Any]] = []
         try:
             clean_body = self._strip_raise_guards(fn_node.body)
             safe_consts = {
-                k: v for k, v in mod_consts.items()
-                if isinstance(v, (int, float)) and math.isfinite(float(v))
+                k: v for k, v in {**self.module_constants, **mod_consts}.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
             }
             compiler = ASTFunctionToSymPy({}, safe_consts, self._helper_ast_map)
             for p in params:
                 compiler.env[p] = sp.Symbol(p, real=True)
             sym_expr = compiler.compile_statements(clean_body, compiler.env)
             discs = list(compiler.discontinuities)
+            assert_constrs = list(compiler.assert_constraints)
         except Exception:
             sym_expr = None
 
@@ -322,6 +516,8 @@ class StaticRepoASTExtractor:
             sympy_expr=sym_expr,
             precondition_bounds=guard_bounds,
             discontinuities=discs,
+            guard_constraints=guard_constrs,
+            assert_constraints=assert_constrs,
         )
 
     def _build_class_spec(
@@ -453,6 +649,14 @@ class StaticRepoASTExtractor:
         fn_node = spec.ast_node
         arg_names = [a.arg for a in fn_node.args.args]
         defaults_map = dict(spec.defaults)
+        helper_specs: Dict[str, Tuple[ast.FunctionDef, Dict[str, Any], Dict[str, Any]]] = {
+            h_name: (
+                (self.functions[h_name].ast_node if h_name in self.functions else h_clean),
+                dict(h_consts),
+                dict(self._helper_defaults_map.get(h_name, {})),
+            )
+            for h_name, (h_clean, h_consts) in self._helper_ast_map.items()
+        }
 
         def _safe_callable(*args: Any, **kwargs: Any) -> Any:
             env: Dict[str, Any] = dict(safe_consts)
@@ -465,7 +669,11 @@ class StaticRepoASTExtractor:
                     env[a_name] = defaults_map[a_name]
                 else:
                     raise TypeError(f"Missing required argument '{a_name}' for '{fn_name}'.")
-            interp = _SafeSimulationASTInterpreter(env=env, max_loop_steps=max_loop_steps)
+            interp = _SafeSimulationASTInterpreter(
+                env=env,
+                max_loop_steps=max_loop_steps,
+                helper_specs=helper_specs,
+            )
             return interp.run_body(fn_node.body)
 
         return _safe_callable
@@ -513,10 +721,18 @@ _SAFE_MATH_ATTRS: Dict[str, Callable[..., Any]] = {
 class _SafeSimulationASTInterpreter:
     """Intérprete estático de subconjunto imperativo puro sobre AST de función (cero ejecución de top-level)."""
 
-    def __init__(self, env: Dict[str, Any], max_loop_steps: int = 50_000):
+    def __init__(
+        self,
+        env: Dict[str, Any],
+        max_loop_steps: int = 50_000,
+        helper_specs: Optional[Dict[str, Tuple[ast.FunctionDef, Dict[str, Any], Dict[str, Any]]]] = None,
+        call_depth: int = 0,
+    ):
         self.env = env
         self.max_loop_steps = max_loop_steps
         self._steps = 0
+        self.helper_specs = helper_specs or {}
+        self.call_depth = call_depth
 
     def _tick(self) -> None:
         self._steps += 1
@@ -657,11 +873,19 @@ class _SafeSimulationASTInterpreter:
             kwargs = {kw.arg: self.eval_expr(kw.value, env) for kw in node.keywords if kw.arg is not None}
             if isinstance(node.func, ast.Name) and node.func.id in _SAFE_AST_BUILTINS:
                 return _SAFE_AST_BUILTINS[node.func.id](*args, **kwargs)
+            if isinstance(node.func, ast.Name) and node.func.id in self.helper_specs:
+                return self._invoke_helper(node.func.id, args, kwargs)
             if isinstance(node.func, ast.Attribute):
                 attr = node.func.attr
                 if isinstance(node.func.value, ast.Name) and node.func.value.id in ("math", "np", "numpy"):
                     if attr in _SAFE_MATH_ATTRS:
                         return _SAFE_MATH_ATTRS[attr](*args, **kwargs)
+                if (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id not in env
+                    and attr in self.helper_specs
+                ):
+                    return self._invoke_helper(attr, args, kwargs)
                 recv = self.eval_expr(node.func.value, env)
                 if isinstance(recv, list) and attr == "append" and len(args) == 1 and not kwargs:
                     recv.append(args[0])
@@ -670,6 +894,32 @@ class _SafeSimulationASTInterpreter:
                     return recv.get(*args)
             raise ValueError(f"Disallowed call in safe AST simulation: {ast.dump(node.func)}")
         raise ValueError(f"Unsupported AST expression in safe simulation: {type(node).__name__}")
+
+    def _invoke_helper(self, helper_name: str, args: List[Any], kwargs: Dict[str, Any]) -> Any:
+        if self.call_depth >= 16:
+            raise RuntimeError(f"Safe AST simulation exceeded maximum helper call depth (16) at '{helper_name}'.")
+        h_node, h_consts, h_defaults = self.helper_specs[helper_name]
+        h_args = [a.arg for a in h_node.args.args if a.arg != "self"]
+        sub_env: Dict[str, Any] = dict(h_consts)
+        for idx, p_name in enumerate(h_args):
+            if idx < len(args):
+                sub_env[p_name] = args[idx]
+            elif p_name in kwargs:
+                sub_env[p_name] = kwargs[p_name]
+            elif p_name in h_defaults:
+                sub_env[p_name] = h_defaults[p_name]
+            else:
+                raise TypeError(f"Missing required argument '{p_name}' in helper '{helper_name}'.")
+        sub_interp = _SafeSimulationASTInterpreter(
+            env=sub_env,
+            max_loop_steps=self.max_loop_steps,
+            helper_specs=self.helper_specs,
+            call_depth=self.call_depth + 1,
+        )
+        sub_interp._steps = self._steps
+        res = sub_interp.run_body(h_node.body)
+        self._steps = sub_interp._steps
+        return res
 
     def _eval_comp(self, elt: ast.AST, generators: List[ast.comprehension], base_env: Dict[str, Any]) -> List[Any]:
         def _step(idx: int, cur_env: Dict[str, Any]) -> List[Any]:
@@ -733,6 +983,11 @@ class _SafeSimulationASTInterpreter:
                 self._bind_target(stmt.target, item, self.env)
                 for s in stmt.body:
                     self.exec_stmt(s)
+            return
+        if isinstance(stmt, ast.Assert):
+            if not self.eval_expr(stmt.test, self.env):
+                msg_val = self.eval_expr(stmt.msg, self.env) if stmt.msg is not None else "Assertion guard triggered."
+                raise ValueError(str(msg_val))
             return
         if isinstance(stmt, ast.Raise):
             if stmt.exc is not None:

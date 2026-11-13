@@ -23,6 +23,7 @@ from sympy.parsing.sympy_parser import parse_expr
 
 from ..ingest import ASTIngestPipeline, compile_source_to_ir
 from ..ingest_adapters.engine import RepositoryCausalEngine
+from ..ingest_adapters.generic_adapter import ContractASTMismatchError
 from ..layer1_heuristic import Layer1Router
 from ..layer2_exact import Layer2Solver
 from ..schema import CausalGraph, Constraint
@@ -511,6 +512,17 @@ class ActorDBOracle:
                             self._cache.pop(next(iter(self._cache)), None)
                         self._cache[ckey] = g
                     return g, False, None
+                except ContractASTMismatchError as exc:
+                    return None, False, {
+                        "status": "ERROR",
+                        "error_code": exc.error_code,
+                        "seal": "UNSUPPORTED",
+                        "submodel": exc.submodel,
+                        "missing_identifiers": exc.missing_identifiers,
+                        "available_actors": exc.available_actors,
+                        "message": str(exc),
+                        "zero_hallucination_verified": True,
+                    }
                 except Exception as exc:
                     return None, False, {
                         "status": "ERROR",
@@ -887,9 +899,12 @@ class ActorDBOracle:
                         constraint_guard_nodes.add(v_id)
                         constraint_guard_nodes.update(nx.ancestors(dag, v_id))
 
+        unclassified_set: Set[str] = set((graph.metadata or {}).get("unclassified_leaves") or [])
         dead_list: List[Dict[str, Any]] = []
         for nid, node in graph.nodes.items():
-            if nid == target_id or node.category in ("target", "exogenous"):
+            if nid == target_id or node.category == "target":
+                continue
+            if node.category == "exogenous" and nid not in unclassified_set:
                 continue
 
             has_target_path = dag.has_node(nid) and dag.has_node(target_id) and nx.has_path(dag, nid, target_id)
@@ -950,6 +965,35 @@ class ActorDBOracle:
                             "line_range": node.source_reference.line_range if node.source_reference else None,
                             "reason": (
                                 f"Control lever '{nid}' has identically zero total derivative toward '{target_id}'."
+                            ),
+                        })
+            elif node.category == "exogenous" and nid in unclassified_set:
+                if not has_target_path and not guards_constraint:
+                    dead_list.append({
+                        "node": nid,
+                        "category": node.category,
+                        "subtype": "T1-C_DISCONNECTED_INPUT",
+                        "file": node.source_reference.file if node.source_reference else None,
+                        "line_range": node.source_reference.line_range if node.source_reference else None,
+                        "reason": (
+                            f"Unclassified leaf parameter '{nid}' has no directed causal path to target '{target_id}' "
+                            f"and participates in no hard invariant."
+                        ),
+                    })
+                elif has_target_path and not guards_constraint:
+                    _, _, is_zero = cls._symbolic_and_numeric_derivative(
+                        dag, syms, mechanisms, nominal_state, nid, target_id, graph=graph, compiled_fns=compiled_fns
+                    )
+                    if is_zero:
+                        dead_list.append({
+                            "node": nid,
+                            "category": node.category,
+                            "subtype": "T1-B_ALGEBRAIC_PATH_CANCELLATION",
+                            "file": node.source_reference.file if node.source_reference else None,
+                            "line_range": node.source_reference.line_range if node.source_reference else None,
+                            "reason": (
+                                f"Unclassified leaf parameter '{nid}' has topological path(s) to '{target_id}', "
+                                f"but its total derivative cancels identically (d({target_id})/d({nid}) == 0)."
                             ),
                         })
         return dead_list
@@ -1648,6 +1692,8 @@ class ActorDBOracle:
         target_value: Optional[float] = None,
         fixed_controls: Optional[Dict[str, float]] = None,
         exo_overrides: Optional[Dict[str, float]] = None,
+        modifiable_controls: Optional[List[str]] = None,
+        control_bounds: Optional[Dict[str, List[float]]] = None,
         ignore_constraints: bool = False,
         source_path: Optional[str] = None,
         graph_data: Optional[Dict[str, Any]] = None,
@@ -1658,6 +1704,10 @@ class ActorDBOracle:
             hints_s.extend(str(k) for k in fixed_controls.keys())
         if isinstance(exo_overrides, dict):
             hints_s.extend(str(k) for k in exo_overrides.keys())
+        if isinstance(modifiable_controls, (list, tuple)):
+            hints_s.extend(str(k) for k in modifiable_controls)
+        if isinstance(control_bounds, dict):
+            hints_s.extend(str(k) for k in control_bounds.keys())
         graph, cache_hit, err = self.resolve_graph(
             source_path=source_path,
             graph_data=graph_data,
@@ -1667,15 +1717,26 @@ class ActorDBOracle:
         if err is not None or graph is None:
             return _clean_json_val(err)
 
+        mod_set_hint = set(str(x) for x in modifiable_controls) if isinstance(modifiable_controls, (list, tuple)) else set()
+
         def _solve_submodel_matches(g_cand: CausalGraph) -> bool:
             if target_id is not None and target_id not in g_cand.nodes:
                 return False
+            if mod_set_hint and any(
+                mc not in g_cand.nodes or g_cand.nodes[mc].category not in ("exogenous", "control")
+                for mc in mod_set_hint
+            ):
+                return False
+            if isinstance(control_bounds, dict) and any(bk not in g_cand.nodes for bk in control_bounds):
+                return False
             if isinstance(fixed_controls, dict) and any(
-                k not in g_cand.nodes or g_cand.nodes[k].category != "control" for k in fixed_controls
+                k not in g_cand.nodes or (g_cand.nodes[k].category != "control" and k not in mod_set_hint)
+                for k in fixed_controls
             ):
                 return False
             if isinstance(exo_overrides, dict) and any(
-                k not in g_cand.nodes or g_cand.nodes[k].category != "exogenous" for k in exo_overrides
+                k not in g_cand.nodes or g_cand.nodes[k].category != "exogenous" or k in mod_set_hint
+                for k in exo_overrides
             ):
                 return False
             return True
@@ -1686,6 +1747,134 @@ class ActorDBOracle:
             )
             if alt_s is not None:
                 graph, cache_hit = alt_s
+
+        # Promoción explícita de controles modificables y cotas por consulta (Resolución honesta de P5)
+        if modifiable_controls is not None or control_bounds is not None:
+            if modifiable_controls is not None and not isinstance(modifiable_controls, (list, tuple)):
+                return _clean_json_val({
+                    "status": "ERROR",
+                    "error_code": "INVALID_MODIFIABLE_CONTROL",
+                    "seal": "UNSUPPORTED",
+                    "message": "modifiable_controls must be a list of leaf actor IDs.",
+                    "zero_hallucination_verified": True,
+                })
+            if control_bounds is not None and not isinstance(control_bounds, dict):
+                return _clean_json_val({
+                    "status": "ERROR",
+                    "error_code": "INVALID_CONTROL_BOUNDS",
+                    "seal": "UNSUPPORTED",
+                    "message": "control_bounds must be a dictionary mapping control IDs to [min, max] pairs.",
+                    "zero_hallucination_verified": True,
+                })
+
+            for mc_raw in modifiable_controls or []:
+                mc_id = str(mc_raw)
+                if mc_id not in graph.nodes:
+                    return _clean_json_val({
+                        "status": "ERROR",
+                        "error_code": "UNKNOWN_ACTOR",
+                        "seal": "UNSUPPORTED",
+                        "message": f"Actor '{mc_id}' in modifiable_controls does not exist in graph '{graph.system_id}'.",
+                        "available_actors": sorted(graph.nodes.keys()),
+                        "zero_hallucination_verified": True,
+                    })
+                if graph.nodes[mc_id].category not in ("exogenous", "control"):
+                    return _clean_json_val({
+                        "status": "ERROR",
+                        "error_code": "INVALID_MODIFIABLE_CONTROL",
+                        "seal": "UNSUPPORTED",
+                        "message": (
+                            f"Actor '{mc_id}' has category '{graph.nodes[mc_id].category}' (computed mechanism) "
+                            f"and cannot be promoted to a leaf decision lever."
+                        ),
+                        "zero_hallucination_verified": True,
+                    })
+
+            work_graph = CausalGraph.from_dict(graph.to_dict())
+            if getattr(graph, "_blackbox_callables", None):
+                work_graph._blackbox_callables = dict(graph._blackbox_callables)
+
+            if modifiable_controls is not None:
+                for mc_raw in modifiable_controls:
+                    work_graph.nodes[str(mc_raw)].category = "control"
+                work_graph.metadata = dict(work_graph.metadata or {})
+                work_graph.metadata["unclassified_leaves"] = []
+
+            if control_bounds:
+                for bk_raw, b_val in control_bounds.items():
+                    bk = str(bk_raw)
+                    if bk not in work_graph.nodes:
+                        return _clean_json_val({
+                            "status": "ERROR",
+                            "error_code": "UNKNOWN_ACTOR",
+                            "seal": "UNSUPPORTED",
+                            "message": f"Actor '{bk}' in control_bounds does not exist in graph '{work_graph.system_id}'.",
+                            "available_actors": sorted(work_graph.nodes.keys()),
+                            "zero_hallucination_verified": True,
+                        })
+                    if work_graph.nodes[bk].category != "control":
+                        return _clean_json_val({
+                            "status": "ERROR",
+                            "error_code": "INVALID_CONTROL_BOUNDS",
+                            "seal": "UNSUPPORTED",
+                            "message": (
+                                f"Actor '{bk}' in control_bounds is not a control lever "
+                                f"(category='{work_graph.nodes[bk].category}'). Pass it in modifiable_controls first."
+                            ),
+                            "zero_hallucination_verified": True,
+                        })
+                    if not isinstance(b_val, (list, tuple)) or len(b_val) != 2:
+                        return _clean_json_val({
+                            "status": "ERROR",
+                            "error_code": "INVALID_CONTROL_BOUNDS",
+                            "seal": "UNSUPPORTED",
+                            "message": f"control_bounds for '{bk}' must be a 2-element [min, max] list.",
+                            "zero_hallucination_verified": True,
+                        })
+                    req_lb = float(b_val[0]) if b_val[0] is not None else None
+                    req_ub = float(b_val[1]) if b_val[1] is not None else None
+                    if (req_lb is not None and not math.isfinite(req_lb)) or (
+                        req_ub is not None and not math.isfinite(req_ub)
+                    ):
+                        return _clean_json_val({
+                            "status": "ERROR",
+                            "error_code": "NON_FINITE_VALUE",
+                            "seal": "UNSUPPORTED",
+                            "message": f"control_bounds for '{bk}' must contain finite values, got {b_val!r}.",
+                            "zero_hallucination_verified": True,
+                        })
+                    if req_lb is not None and req_ub is not None and req_lb > req_ub:
+                        return _clean_json_val({
+                            "status": "ERROR",
+                            "error_code": "INVALID_CONTROL_BOUNDS",
+                            "seal": "UNSUPPORTED",
+                            "message": f"Inverted control_bounds [{req_lb}, {req_ub}] for '{bk}' (min > max).",
+                            "zero_hallucination_verified": True,
+                        })
+                    cur_b = dict(work_graph.nodes[bk].bounds or {"min": None, "max": None})
+                    ast_lb, ast_ub = cur_b.get("min"), cur_b.get("max")
+                    eff_lb = req_lb if ast_lb is None else (ast_lb if req_lb is None else max(float(ast_lb), req_lb))
+                    eff_ub = req_ub if ast_ub is None else (ast_ub if req_ub is None else min(float(ast_ub), req_ub))
+                    if eff_lb is not None and eff_ub is not None and eff_lb > eff_ub:
+                        return _clean_json_val({
+                            "status": "INFEASIBLE",
+                            "certificate_status": SolveStatus.INFEASIBLE_CERTIFIED.value,
+                            "seal": "PROVEN",
+                            "system_id": work_graph.system_id,
+                            "target_id": target_id,
+                            "iis_constraints": [f"ast_precondition_bounds:{bk}"],
+                            "blocking_constraints": [f"ast_precondition_bounds:{bk}"],
+                            "controls": {},
+                            "objective_value": None,
+                            "reason": (
+                                f"Requested control_bounds [{req_lb}, {req_ub}] for '{bk}' conflict with "
+                                f"hard AST precondition bounds [{ast_lb}, {ast_ub}]."
+                            ),
+                            "zero_hallucination_verified": True,
+                        })
+                    work_graph.nodes[bk].bounds = {"min": eff_lb, "max": eff_ub}
+
+            graph = work_graph
 
         resolved_target, t_err = self._resolve_target_id(graph, target_id)
         if t_err is not None or resolved_target is None:
@@ -1778,7 +1967,33 @@ class ActorDBOracle:
         # Resistencia anti-sicofancia (GAP-03): jamás relajar ni ignorar restricciones duras ante presiones
         pressure_resisted = bool(ignore_constraints)
 
-        # Caso degenerado válido: grafo sin palancas de control (0 grados de libertad)
+        # Compuerta epistémica P5: en ingesta Zero-Config sin roles declarados ni `modifiable_controls`,
+        # jamás adivinar palancas ni devolver un falso óptimo trivial sin controles.
+        unclassified_p5 = (graph.metadata or {}).get("unclassified_leaves") or []
+        if not control_ids and unclassified_p5 and modifiable_controls is None:
+            cand_leaves = sorted(str(x) for x in unclassified_p5)
+            return _clean_json_val({
+                "status": "UNSUPPORTED",
+                "certificate_status": SolveStatus.UNSUPPORTED.value,
+                "error_code": "AMBIGUOUS_LEAF_ROLES_P5",
+                "seal": "UNSUPPORTED",
+                "system_id": graph.system_id,
+                "target_id": resolved_target,
+                "sense": resolved_sense,
+                "candidate_leaves": cand_leaves,
+                "controls": {},
+                "objective_value": None,
+                "reason": (
+                    f"Zero-config package '{graph.system_id}' has unclassified input parameters {cand_leaves} "
+                    f"without declared control vs exogenous roles (P5). Pass `modifiable_controls=[...]` "
+                    f"(and optional `control_bounds`) to `cge_solve`, or declare `controls` in `actordb.yaml`."
+                ),
+                "pressure_resisted": pressure_resisted,
+                "cache_hit": cache_hit,
+                "zero_hallucination_verified": True,
+            })
+
+        # Caso degenerado válido: grafo explícitamente sin palancas de control (0 grados de libertad)
         if not control_ids:
             do_res = self.do(interventions={}, target_id=resolved_target, context=exo_overrides, graph_data=graph)
             if do_res.get("status") != "OK":

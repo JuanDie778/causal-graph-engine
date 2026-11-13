@@ -663,11 +663,14 @@ class CausalDiffEngine:
         ):
             return None
         adapter_b = repo_eng.get_adapter(spec_b["repo_id"], str(spec_b["repo_dir"]))
-        avail_subs = adapter_b.list_submodels() if (adapter_b and hasattr(adapter_b, "list_submodels")) else []
-        if len(avail_subs) <= 1:
+        adapter_h = repo_eng.get_adapter(spec_h["repo_id"], str(spec_h["repo_dir"]))
+        avail_subs_b = adapter_b.list_submodels() if (adapter_b and hasattr(adapter_b, "list_submodels")) else []
+        avail_subs_h = adapter_h.list_submodels() if (adapter_h and hasattr(adapter_h, "list_submodels")) else []
+        shared_subs = [s for s in avail_subs_b if s in avail_subs_h]
+        if len(shared_subs) <= 1:
             return None
         pairs: List[Tuple[str, CausalGraph, CausalGraph]] = []
-        for sub_name in avail_subs:
+        for sub_name in shared_subs:
             gb_sub = load_causal_graph(base, entrypoint=sub_name)
             gh_sub = load_causal_graph(head, entrypoint=sub_name)
             pairs.append((sub_name, gb_sub, gh_sub))
@@ -807,6 +810,8 @@ class CausalDiffEngine:
                 (sub_n, gb_s, gh_s)
                 for sub_n, gb_s, gh_s in submodel_pairs
                 if self._has_any_structural_change(self._compute_structural_diff(gb_s, gh_s))
+                or str((gb_s.metadata or {}).get("sense", "max")).lower()
+                != str((gh_s.metadata or {}).get("sense", "max")).lower()
             ]
             if len(changed_pairs) == 1:
                 _, gb_one, gh_one = changed_pairs[0]
