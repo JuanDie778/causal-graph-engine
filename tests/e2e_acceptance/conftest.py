@@ -63,9 +63,16 @@ def test_grader_script(baseline_bench_dir: Path) -> Path:
 
 
 @pytest.fixture(scope="session")
-def report_script(baseline_bench_dir: Path) -> Path:
-    """Returns the path to report.py."""
-    return baseline_bench_dir / "report.py"
+def report_script(baseline_bench_dir: Path) -> Generator[Path, None, None]:
+    """Returns the path to report.py and preserves baseline_v0_summary.json clean state."""
+    summary_path = baseline_bench_dir / "baseline_v0_summary.json"
+    orig_bytes = summary_path.read_bytes() if summary_path.exists() else None
+    try:
+        yield baseline_bench_dir / "report.py"
+    finally:
+        if orig_bytes is not None:
+            summary_path.write_bytes(orig_bytes)
+        (baseline_bench_dir / "nonexistent_baseline_tag_xyz_summary.json").unlink(missing_ok=True)
 
 
 @pytest.fixture(scope="session")

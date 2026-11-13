@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import networkx as nx
 import sympy as sp
@@ -31,6 +32,13 @@ class SupplyChainCausalAdapter:
     """Compila estáticamente `supplychainpy_mini` (EOQ, descuentos por volumen, SS/ROP y simulación) a IR CGE."""
 
     REPO_ID = "supplychainpy_mini"
+    SUBMODELS: Tuple[str, ...] = (
+        "eoq_cost",
+        "eoq_formula",
+        "volume_discount",
+        "safety_stock",
+        "inventory_sim",
+    )
 
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
@@ -292,6 +300,11 @@ class SupplyChainCausalAdapter:
             nodes=nodes,
             edges=edges,
             constraints=constraints,
+            metadata={
+                "sense": "min",
+                "repo_id": self.REPO_ID,
+                "source_path": self.repo_path,
+            },
         )
 
     @staticmethod
@@ -589,7 +602,6 @@ class SupplyChainCausalAdapter:
                 derivs["daily_demand"] = round(lt, 6)
             ranking = sorted(derivs.keys(), key=lambda k: abs(derivs[k]), reverse=True)
 
-            w_cand_ss = f"{raw_wrt} {exp_den} {wc_sc}".strip()
             if raw_wrt in ("lead_time_days", "lead_time", "l", "lt") or exp_den in ("l", "lt", "lead_time", "lead_time_days") or any(w in wc_sc for w in ("lead_time", "lead time", "tiempo de entrega", "plazo")):
                 primary = derivs["lead_time_days"]
                 chosen_ss_k = "lead_time_days"
@@ -1089,7 +1101,6 @@ class SupplyChainCausalAdapter:
 
     def _handle_q6(self, ctx: QueryContext) -> AdapterResponse:
         p = ctx.parameters
-        p_low = ctx.prompt.lower()
 
         # 1. Resistencia a presión / sicofancia sobre capacidad física o presupuesto
         if detect_pressure_attempt(ctx):
@@ -1325,3 +1336,766 @@ class SupplyChainCausalAdapter:
             confidence_claim="UNSUPPORTED_DOMAIN",
             raw_answer=f"Tipo de consulta '{q}' no soportado.",
         )
+
+    def list_submodels(self) -> List[str]:
+        return list(self.SUBMODELS)
+
+    def default_submodel(self) -> str:
+        return "eoq_cost"
+
+    def infer_submodel(
+        self,
+        target_id: Optional[str] = None,
+        actor_hints: Optional[Sequence[str]] = None,
+        file_hint: Optional[str] = None,
+    ) -> str:
+        hints: Set[str] = set(actor_hints or [])
+        if target_id:
+            hints.add(target_id)
+
+        sim_only = {
+            "initial_stock",
+            "daily_demand_mean",
+            "horizon_days",
+            "total_stockout_units",
+            "final_inventory",
+            "total_fulfilled",
+            "orders_placed",
+            "capacity_violations",
+        }
+        ss_only = {
+            "daily_demand",
+            "daily_demand_std",
+            "service_level",
+            "z_score",
+            "safety_stock",
+            "lead_time_demand",
+        }
+        if hints & sim_only:
+            return "inventory_sim"
+        if hints & ss_only or target_id == "reorder_point":
+            return "safety_stock"
+        if target_id in ("eoq", "optimal_eoq") or (
+            (hints & {"eoq", "optimal_eoq"}) and not (hints & {"order_quantity", "total_cost"})
+        ):
+            return "eoq_formula"
+        if "holding_rate" in hints:
+            return "volume_discount"
+
+        if file_hint:
+            fname = Path(file_hint).name.lower()
+            if fname == "safety_stock.py":
+                return "safety_stock"
+            if fname == "inventory_sim.py":
+                return "inventory_sim"
+
+        return self.default_submodel()
+
+    def build_causal_graph(
+        self,
+        submodel: Optional[str] = None,
+        target_hint: Optional[str] = None,
+        actor_hints: Optional[Sequence[str]] = None,
+        file_hint: Optional[str] = None,
+    ) -> CausalGraph:
+        """Compila un submodelo autocontenido de `supplychainpy_mini` desde el AST vivo a `CausalGraph`."""
+        chosen = (submodel or "").strip() or self.infer_submodel(
+            target_id=target_hint,
+            actor_hints=actor_hints,
+            file_hint=file_hint,
+        )
+        if chosen not in self.SUBMODELS:
+            raise ValueError(
+                f"Unknown submodel '{chosen}' for '{self.REPO_ID}'. Available submodels: {list(self.SUBMODELS)}"
+            )
+
+        base_meta = {
+            "repo_id": self.REPO_ID,
+            "submodel": chosen,
+            "available_submodels": list(self.SUBMODELS),
+            "source_path": self.repo_path,
+        }
+
+        if chosen == "eoq_cost":
+            tc_fn = self.extractor.functions.get("calculate_total_cost")
+            rel_file = tc_fn.rel_file if tc_fn else "supplychainpy_mini/eoq.py"
+            lineno = tc_fn.lineno if tc_fn else 26
+            eqs = self.extractor.extract_structural_equations(
+                "calculate_total_cost",
+                keep_symbols={
+                    "purchase_cost": "purchase_cost",
+                    "ordering_cost": "ordering_cost",
+                    "holding_cost": "holding_cost",
+                },
+            )
+
+            d_nom, s_nom, c_nom, h_nom, cap_nom = 12000.0, 100.0, 10.0, 2.0, 5000.0
+            q_nom = 500.0
+
+            pc_expr, pc_line = eqs.get("purchase_cost", (sp.sympify("annual_demand * unit_cost"), lineno))
+            oc_expr, oc_line = eqs.get(
+                "ordering_cost", (sp.sympify("(annual_demand / order_quantity) * order_cost"), lineno)
+            )
+            hc_expr, hc_line = eqs.get(
+                "holding_cost", (sp.sympify("0.5 * order_quantity * holding_cost_per_unit"), lineno)
+            )
+            tc_expr, tc_line = eqs.get(
+                "__return__", (sp.sympify("purchase_cost + ordering_cost + holding_cost"), lineno)
+            )
+
+            subs_nom = {
+                sp.Symbol("annual_demand", real=True): d_nom,
+                sp.Symbol("order_cost", real=True): s_nom,
+                sp.Symbol("unit_cost", real=True): c_nom,
+                sp.Symbol("holding_cost_per_unit", real=True): h_nom,
+                sp.Symbol("order_quantity", real=True): q_nom,
+            }
+            pc_val = float(pc_expr.evalf(subs=subs_nom))
+            oc_val = float(oc_expr.evalf(subs=subs_nom))
+            hc_val = float(hc_expr.evalf(subs=subs_nom))
+            subs_nom[sp.Symbol("purchase_cost", real=True)] = pc_val
+            subs_nom[sp.Symbol("ordering_cost", real=True)] = oc_val
+            subs_nom[sp.Symbol("holding_cost", real=True)] = hc_val
+            tc_val = float(tc_expr.evalf(subs=subs_nom))
+
+            nodes = [
+                make_verified_node(
+                    "annual_demand",
+                    "exogenous",
+                    rel_file,
+                    "annual_demand",
+                    lineno,
+                    current_value=d_nom,
+                    bounds={"min": 1.0, "max": 1e6},
+                ),
+                make_verified_node(
+                    "order_cost",
+                    "exogenous",
+                    rel_file,
+                    "order_cost",
+                    lineno,
+                    current_value=s_nom,
+                    bounds={"min": 0.01, "max": 1e5},
+                ),
+                make_verified_node(
+                    "unit_cost",
+                    "exogenous",
+                    rel_file,
+                    "unit_cost",
+                    lineno,
+                    current_value=c_nom,
+                    bounds={"min": 0.01, "max": 1e5},
+                ),
+                make_verified_node(
+                    "holding_cost_per_unit",
+                    "exogenous",
+                    rel_file,
+                    "holding_cost_per_unit",
+                    lineno,
+                    current_value=h_nom,
+                    bounds={"min": 0.01, "max": 1e4},
+                ),
+                make_verified_node(
+                    "warehouse_capacity",
+                    "exogenous",
+                    rel_file,
+                    "warehouse_capacity",
+                    lineno,
+                    current_value=cap_nom,
+                    bounds={"min": 10.0, "max": 1e6},
+                ),
+                make_verified_node(
+                    "order_quantity",
+                    "control",
+                    rel_file,
+                    "order_quantity",
+                    lineno,
+                    current_value=q_nom,
+                    bounds={"min": 1.0, "max": 10000.0},
+                ),
+                make_verified_node(
+                    "purchase_cost",
+                    "state",
+                    rel_file,
+                    "calculate_total_cost",
+                    pc_line,
+                    current_value=pc_val,
+                    symbolic_expr=str(pc_expr),
+                ),
+                make_verified_node(
+                    "ordering_cost",
+                    "state",
+                    rel_file,
+                    "calculate_total_cost",
+                    oc_line,
+                    current_value=oc_val,
+                    symbolic_expr=str(oc_expr),
+                ),
+                make_verified_node(
+                    "holding_cost",
+                    "state",
+                    rel_file,
+                    "calculate_total_cost",
+                    hc_line,
+                    current_value=hc_val,
+                    symbolic_expr=str(hc_expr),
+                ),
+                make_verified_node(
+                    "total_cost",
+                    "target",
+                    rel_file,
+                    "calculate_total_cost",
+                    tc_line,
+                    current_value=tc_val,
+                    symbolic_expr=str(tc_expr),
+                ),
+            ]
+            node_ids = {n.id for n in nodes}
+            edges: List[Tuple[str, str]] = []
+            for dst_id, expr_obj in (
+                ("purchase_cost", pc_expr),
+                ("ordering_cost", oc_expr),
+                ("holding_cost", hc_expr),
+                ("total_cost", tc_expr),
+            ):
+                for sym in sorted(expr_obj.free_symbols, key=lambda s: s.name):
+                    if sym.name in node_ids and sym.name != dst_id:
+                        edges.append((sym.name, dst_id))
+
+            constraints = [
+                Constraint(
+                    id="c_warehouse_capacity",
+                    type="hard",
+                    expression="order_quantity <= warehouse_capacity",
+                    description="Physical warehouse storage ceiling on order quantity.",
+                ),
+                Constraint(
+                    id="c_nonneg_costs",
+                    type="hard",
+                    expression="purchase_cost >= 0.0 and ordering_cost >= 0.0 and holding_cost >= 0.0",
+                    description="Inventory cost components are strictly non-negative over positive demand/cost domains.",
+                ),
+            ]
+            return build_verified_causal_graph(
+                system_id="supplychainpy_mini_eoq_cost",
+                nodes=nodes,
+                edges=edges,
+                constraints=constraints,
+                metadata={"sense": "min", **base_meta},
+            )
+
+        if chosen == "eoq_formula":
+            eoq_fn = self.extractor.functions.get("calculate_eoq")
+            rel_file = eoq_fn.rel_file if eoq_fn else "supplychainpy_mini/eoq.py"
+            lineno = eoq_fn.lineno if eoq_fn else 6
+            eoq_expr = (
+                eoq_fn.sympy_expr
+                if (eoq_fn and eoq_fn.sympy_expr is not None)
+                else sp.sympify("sqrt((2.0 * annual_demand * order_cost) / holding_cost_per_unit)")
+            )
+            d_nom, s_nom, h_nom = 12000.0, 100.0, 2.0
+            eoq_val = float(
+                eoq_expr.evalf(
+                    subs={
+                        sp.Symbol("annual_demand", real=True): d_nom,
+                        sp.Symbol("order_cost", real=True): s_nom,
+                        sp.Symbol("holding_cost_per_unit", real=True): h_nom,
+                    }
+                )
+            )
+            nodes = [
+                make_verified_node(
+                    "annual_demand",
+                    "exogenous",
+                    rel_file,
+                    "annual_demand",
+                    lineno,
+                    current_value=d_nom,
+                    bounds={"min": 1.0, "max": 1e6},
+                ),
+                make_verified_node(
+                    "order_cost",
+                    "exogenous",
+                    rel_file,
+                    "order_cost",
+                    lineno,
+                    current_value=s_nom,
+                    bounds={"min": 0.01, "max": 1e5},
+                ),
+                make_verified_node(
+                    "holding_cost_per_unit",
+                    "exogenous",
+                    rel_file,
+                    "holding_cost_per_unit",
+                    lineno,
+                    current_value=h_nom,
+                    bounds={"min": 0.01, "max": 1e4},
+                ),
+                make_verified_node(
+                    "eoq",
+                    "target",
+                    rel_file,
+                    "calculate_eoq",
+                    lineno,
+                    current_value=eoq_val,
+                    symbolic_expr=str(eoq_expr),
+                ),
+            ]
+            node_ids = {n.id for n in nodes}
+            edges = [
+                (sym.name, "eoq")
+                for sym in sorted(eoq_expr.free_symbols, key=lambda s: s.name)
+                if sym.name in node_ids and sym.name != "eoq"
+            ]
+            constraints = [
+                Constraint(
+                    id="c_eoq_positive",
+                    type="hard",
+                    expression="eoq >= 0.0",
+                    description="Economic Order Quantity is non-negative over positive cost/demand domains.",
+                )
+            ]
+            return build_verified_causal_graph(
+                system_id="supplychainpy_mini_eoq_formula",
+                nodes=nodes,
+                edges=edges,
+                constraints=constraints,
+                metadata={"sense": "min", **base_meta},
+            )
+
+        if chosen == "volume_discount":
+            ir = self._build_eoq_ir(
+                annual_demand=12000.0,
+                order_cost=100.0,
+                unit_cost=10.0,
+                holding_rate=0.20,
+                brackets=[
+                    {"min_qty": 0.0, "max_qty": 999.0, "unit_cost": 10.0},
+                    {"min_qty": 1000.0, "max_qty": float("inf"), "unit_cost": 8.5},
+                ],
+                q_lb=1.0,
+                q_ub=10000.0,
+                q_init=500.0,
+                warehouse_capacity=5000.0,
+            )
+            ir.system_id = "supplychainpy_mini_volume_discount"
+            ir.metadata.update({"sense": "min", **base_meta})
+            return ir
+
+        if chosen == "safety_stock":
+            ltd_fn = self.extractor.functions.get("calculate_lead_time_demand")
+            ss_fn = self.extractor.functions.get("calculate_safety_stock")
+            rop_fn = self.extractor.functions.get("calculate_reorder_point")
+            rel_file = ss_fn.rel_file if ss_fn else "supplychainpy_mini/safety_stock.py"
+
+            sl_default = float((ss_fn.defaults.get("service_level") if ss_fn else None) or 0.95)
+            d_day_nom, std_nom, lt_nom = 50.0, 10.0, 4.0
+
+            ltd_expr = (
+                ltd_fn.sympy_expr
+                if (ltd_fn and ltd_fn.sympy_expr is not None)
+                else sp.sympify("daily_demand * lead_time_days")
+            )
+            ss_eqs = self.extractor.extract_structural_equations(
+                "calculate_safety_stock",
+                seed_env={"z": sp.Symbol("z_score", real=True), "z_score": sp.Symbol("z_score", real=True)},
+            )
+            ss_expr = (
+                ss_eqs["__return__"][0]
+                if "__return__" in ss_eqs
+                else sp.sympify("z_score * daily_demand_std * sqrt(lead_time_days)")
+            )
+            rop_eqs = self.extractor.extract_structural_equations(
+                "calculate_reorder_point",
+                keep_symbols={
+                    "mu_l": "lead_time_demand",
+                    "ltd": "lead_time_demand",
+                    "ss": "safety_stock",
+                },
+                seed_env={
+                    "mu_l": sp.Symbol("lead_time_demand", real=True),
+                    "ltd": sp.Symbol("lead_time_demand", real=True),
+                    "ss": sp.Symbol("safety_stock", real=True),
+                },
+            )
+            rop_expr = (
+                rop_eqs["__return__"][0]
+                if "__return__" in rop_eqs
+                else sp.sympify("lead_time_demand + safety_stock")
+            )
+
+            def _safe_norm_ppf(service_level: float) -> float:
+                p = float(service_level)
+                if not (0.0 < p < 1.0):
+                    raise ValueError(f"Service level must be strictly between 0 and 1, got {p}.")
+                return float(norm.ppf(p))
+
+            z_nom = _safe_norm_ppf(sl_default)
+            ltd_val = float(
+                ltd_expr.evalf(
+                    subs={
+                        sp.Symbol("daily_demand", real=True): d_day_nom,
+                        sp.Symbol("lead_time_days", real=True): lt_nom,
+                    }
+                )
+            )
+            ss_val = float(
+                ss_expr.evalf(
+                    subs={
+                        sp.Symbol("z_score", real=True): z_nom,
+                        sp.Symbol("daily_demand_std", real=True): std_nom,
+                        sp.Symbol("lead_time_days", real=True): lt_nom,
+                    }
+                )
+            )
+            rop_val = float(
+                rop_expr.evalf(
+                    subs={
+                        sp.Symbol("lead_time_demand", real=True): ltd_val,
+                        sp.Symbol("safety_stock", real=True): ss_val,
+                    }
+                )
+            )
+
+            nodes = [
+                make_verified_node(
+                    "daily_demand",
+                    "exogenous",
+                    rel_file,
+                    "daily_demand",
+                    ltd_fn.lineno if ltd_fn else 7,
+                    current_value=d_day_nom,
+                    bounds={"min": 0.0, "max": 10000.0},
+                ),
+                make_verified_node(
+                    "daily_demand_std",
+                    "exogenous",
+                    rel_file,
+                    "daily_demand_std",
+                    ss_fn.lineno if ss_fn else 17,
+                    current_value=std_nom,
+                    bounds={"min": 0.0, "max": 5000.0},
+                ),
+                make_verified_node(
+                    "lead_time_days",
+                    "exogenous",
+                    rel_file,
+                    "lead_time_days",
+                    ss_fn.lineno if ss_fn else 17,
+                    current_value=lt_nom,
+                    bounds={"min": 0.1, "max": 365.0},
+                ),
+                make_verified_node(
+                    "service_level",
+                    "control",
+                    rel_file,
+                    "service_level",
+                    ss_fn.lineno if ss_fn else 17,
+                    current_value=sl_default,
+                    bounds={"min": 0.50, "max": 0.999},
+                ),
+                make_verified_node(
+                    "lead_time_demand",
+                    "state",
+                    rel_file,
+                    "calculate_lead_time_demand",
+                    ltd_fn.lineno if ltd_fn else 7,
+                    current_value=ltd_val,
+                    symbolic_expr=str(ltd_expr),
+                ),
+                make_verified_node(
+                    "z_score",
+                    "state",
+                    rel_file,
+                    "calculate_safety_stock",
+                    ss_fn.lineno if ss_fn else 35,
+                    current_value=z_nom,
+                    symbolic_expr=None,
+                ),
+                make_verified_node(
+                    "safety_stock",
+                    "state",
+                    rel_file,
+                    "calculate_safety_stock",
+                    ss_fn.lineno if ss_fn else 36,
+                    current_value=ss_val,
+                    symbolic_expr=str(ss_expr),
+                ),
+                make_verified_node(
+                    "reorder_point",
+                    "target",
+                    rel_file,
+                    "calculate_reorder_point",
+                    rop_fn.lineno if rop_fn else 39,
+                    current_value=rop_val,
+                    symbolic_expr=str(rop_expr),
+                ),
+            ]
+            node_ids = {n.id for n in nodes}
+            edges = [("service_level", "z_score")]
+            for dst_id, expr_obj in (
+                ("lead_time_demand", ltd_expr),
+                ("safety_stock", ss_expr),
+                ("reorder_point", rop_expr),
+            ):
+                for sym in sorted(expr_obj.free_symbols, key=lambda s: s.name):
+                    if sym.name in node_ids and sym.name != dst_id:
+                        edges.append((sym.name, dst_id))
+
+            constraints = [
+                Constraint(
+                    id="c_rop_decomposition",
+                    type="hard",
+                    expression="reorder_point == lead_time_demand + safety_stock",
+                    description="Reorder point equals lead-time demand plus safety stock.",
+                ),
+                Constraint(
+                    id="c_nonneg_safety_stock",
+                    type="hard",
+                    expression="safety_stock >= 0.0",
+                    description="Safety stock is non-negative for service_level >= 0.50.",
+                ),
+            ]
+            ir = build_verified_causal_graph(
+                system_id="supplychainpy_mini_safety_stock",
+                nodes=nodes,
+                edges=edges,
+                constraints=constraints,
+                metadata={"sense": "min", **base_meta},
+            )
+            ir._blackbox_callables = {"z_score": (["service_level"], _safe_norm_ppf)}
+            return ir
+
+        # chosen == "inventory_sim"
+        sim_spec = self.extractor.functions.get("simulate_replenishment")
+        rel_file = sim_spec.rel_file if sim_spec else "supplychainpy_mini/inventory_sim.py"
+        lineno = sim_spec.lineno if sim_spec else 6
+
+        live_sim_fn = self.extractor.build_safe_simulation_callable("simulate_replenishment")
+
+        sim_eval_cache: Dict[Tuple[float, ...], Dict[str, Any]] = {}
+
+        def _eval_sim_dict(
+            initial_stock: float,
+            reorder_point: float,
+            order_quantity: float,
+            daily_demand_mean: float,
+            horizon_days: float,
+            lead_time_days: float,
+            warehouse_capacity: float,
+        ) -> Dict[str, Any]:
+            if live_sim_fn is None:
+                raise RuntimeError("simulate_replenishment could not be loaded from inventory_sim.py")
+            h_int = int(round(float(horizon_days)))
+            lt_int = int(round(float(lead_time_days)))
+            if h_int <= 0:
+                raise ValueError("horizon_days must be >= 1")
+            if lt_int < 0:
+                raise ValueError("lead_time_days must be >= 0")
+            if float(order_quantity) <= 0.0 or float(warehouse_capacity) <= 0.0:
+                raise ValueError("order_quantity and warehouse_capacity must be > 0")
+            if float(initial_stock) < 0.0 or float(daily_demand_mean) < 0.0:
+                raise ValueError("initial_stock and daily_demand_mean must be >= 0")
+            ckey = (
+                round(float(initial_stock), 9),
+                round(float(reorder_point), 9),
+                round(float(order_quantity), 9),
+                round(float(daily_demand_mean), 9),
+                float(h_int),
+                float(lt_int),
+                round(float(warehouse_capacity), 9),
+            )
+            if ckey in sim_eval_cache:
+                return sim_eval_cache[ckey]
+            res_d = live_sim_fn(
+                initial_stock=float(initial_stock),
+                daily_demands=[float(daily_demand_mean)] * h_int,
+                lead_time_days=lt_int,
+                reorder_point=float(reorder_point),
+                order_quantity=float(order_quantity),
+                warehouse_capacity=float(warehouse_capacity),
+            )
+            if len(sim_eval_cache) >= 2048:
+                sim_eval_cache.pop(next(iter(sim_eval_cache)))
+            sim_eval_cache[ckey] = res_d
+            return res_d
+
+        sim_params = [
+            "initial_stock",
+            "reorder_point",
+            "order_quantity",
+            "daily_demand_mean",
+            "horizon_days",
+            "lead_time_days",
+            "warehouse_capacity",
+        ]
+        nom_args = {
+            "initial_stock": 160.0,
+            "reorder_point": 80.0,
+            "order_quantity": 90.0,
+            "daily_demand_mean": 40.0,
+            "horizon_days": 30.0,
+            "lead_time_days": 3.0,
+            "warehouse_capacity": 500.0,
+        }
+        nom_sim = _eval_sim_dict(**nom_args)
+
+        nodes = [
+            make_verified_node(
+                "initial_stock",
+                "exogenous",
+                rel_file,
+                "initial_stock",
+                lineno,
+                current_value=nom_args["initial_stock"],
+                bounds={"min": 0.0, "max": 400.0},
+            ),
+            make_verified_node(
+                "daily_demand_mean",
+                "exogenous",
+                rel_file,
+                "daily_demand_mean",
+                lineno,
+                current_value=nom_args["daily_demand_mean"],
+                bounds={"min": 1.0, "max": 500.0},
+            ),
+            make_verified_node(
+                "horizon_days",
+                "exogenous",
+                rel_file,
+                "horizon_days",
+                lineno,
+                current_value=nom_args["horizon_days"],
+                bounds={"min": 1.0, "max": 90.0},
+                data_type="discrete",
+            ),
+            make_verified_node(
+                "lead_time_days",
+                "exogenous",
+                rel_file,
+                "lead_time_days",
+                lineno,
+                current_value=nom_args["lead_time_days"],
+                bounds={"min": 0.0, "max": 30.0},
+                data_type="discrete",
+            ),
+            make_verified_node(
+                "warehouse_capacity",
+                "exogenous",
+                rel_file,
+                "warehouse_capacity",
+                lineno,
+                current_value=nom_args["warehouse_capacity"],
+                bounds={"min": 450.0, "max": 5000.0},
+            ),
+            make_verified_node(
+                "reorder_point",
+                "control",
+                rel_file,
+                "reorder_point",
+                lineno,
+                current_value=nom_args["reorder_point"],
+                bounds={"min": 0.0, "max": 400.0},
+            ),
+            make_verified_node(
+                "order_quantity",
+                "control",
+                rel_file,
+                "order_quantity",
+                lineno,
+                current_value=nom_args["order_quantity"],
+                bounds={"min": 10.0, "max": 400.0},
+            ),
+            make_verified_node(
+                "final_inventory",
+                "state",
+                rel_file,
+                "simulate_replenishment",
+                lineno,
+                current_value=float(nom_sim["final_inventory"]),
+                symbolic_expr=None,
+            ),
+            make_verified_node(
+                "total_fulfilled",
+                "state",
+                rel_file,
+                "simulate_replenishment",
+                lineno,
+                current_value=float(nom_sim["total_fulfilled"]),
+                symbolic_expr=None,
+            ),
+            make_verified_node(
+                "orders_placed",
+                "state",
+                rel_file,
+                "simulate_replenishment",
+                lineno,
+                current_value=float(nom_sim["orders_placed"]),
+                symbolic_expr=None,
+            ),
+            make_verified_node(
+                "capacity_violations",
+                "state",
+                rel_file,
+                "simulate_replenishment",
+                lineno,
+                current_value=float(nom_sim["capacity_violations"]),
+                symbolic_expr=None,
+            ),
+            make_verified_node(
+                "total_stockout_units",
+                "target",
+                rel_file,
+                "simulate_replenishment",
+                lineno,
+                current_value=float(nom_sim["total_stockout_units"]),
+                symbolic_expr=None,
+            ),
+        ]
+        sim_outputs = (
+            "final_inventory",
+            "total_fulfilled",
+            "orders_placed",
+            "capacity_violations",
+            "total_stockout_units",
+        )
+        edges = [(p, out_k) for out_k in sim_outputs for p in sim_params]
+        constraints = [
+            Constraint(
+                id="c_demand_conservation",
+                type="hard",
+                expression="total_fulfilled + total_stockout_units == daily_demand_mean * horizon_days",
+                description="Every unit of demand over the simulation horizon is either fulfilled or counted as stockout.",
+            ),
+            Constraint(
+                id="c_capacity_bound",
+                type="hard",
+                expression="0.0 <= final_inventory and final_inventory <= warehouse_capacity",
+                description="Final physical stock stays non-negative and within warehouse capacity.",
+            ),
+            Constraint(
+                id="c_zero_cap_violations",
+                type="hard",
+                expression="capacity_violations <= 0.0",
+                description="Replenishment policy must not overflow warehouse capacity.",
+            ),
+            Constraint(
+                id="c_nonneg_orders",
+                type="hard",
+                expression="orders_placed >= 0.0",
+                description="Count of replenishment orders is non-negative.",
+            ),
+        ]
+        ir = build_verified_causal_graph(
+            system_id="supplychainpy_mini_inventory_sim",
+            nodes=nodes,
+            edges=edges,
+            constraints=constraints,
+            metadata={"sense": "min", **base_meta},
+        )
+
+        def _make_metric_fn(metric_key: str):
+            return lambda *args: float(_eval_sim_dict(*args)[metric_key])
+
+        ir._blackbox_callables = {out_k: (list(sim_params), _make_metric_fn(out_k)) for out_k in sim_outputs}
+        return ir

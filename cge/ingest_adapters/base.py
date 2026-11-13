@@ -3,13 +3,11 @@ from __future__ import annotations
 
 import ast
 import math
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-import networkx as nx
 import sympy as sp
 
 from ..ingest import ASTFunctionToSymPy
@@ -125,7 +123,7 @@ class StaticRepoASTExtractor:
             return True, tuple(items)
         if isinstance(node, ast.Dict):
             out = {}
-            for k_node, v_node in zip(node.keys, node.values):
+            for k_node, v_node in zip(node.keys, node.values, strict=True):
                 if k_node is None:
                     return False, None
                 ok_k, kv = StaticRepoASTExtractor._eval_static_literal(k_node, consts)
@@ -288,7 +286,7 @@ class StaticRepoASTExtractor:
         n_defs = len(fn_node.args.defaults)
         if n_defs > 0:
             arg_names_all = [a.arg for a in fn_node.args.args]
-            for arg_name, def_node in zip(arg_names_all[-n_defs:], fn_node.args.defaults):
+            for arg_name, def_node in zip(arg_names_all[-n_defs:], fn_node.args.defaults, strict=False):
                 ok, val = self._eval_static_literal(def_node, {**self.module_constants, **mod_consts})
                 if ok:
                     defaults[arg_name] = val
@@ -358,6 +356,402 @@ class StaticRepoASTExtractor:
             docstring=doc,
             methods=methods_map,
         )
+
+    def extract_structural_equations(
+        self,
+        fn_name: str,
+        keep_symbols: Optional[Dict[str, str]] = None,
+        seed_env: Optional[Dict[str, Any]] = None,
+        class_name: Optional[str] = None,
+    ) -> Dict[str, Tuple[sp.Expr, int]]:
+        """Extrae ecuaciones estructurales intermedias SSA desde el AST vivo en disco."""
+        spec: Optional[ExtractedFunctionSpec] = None
+        if class_name and class_name in self.classes:
+            spec = self.classes[class_name].methods.get(fn_name)
+        elif fn_name in self.functions:
+            spec = self.functions.get(fn_name)
+        if spec is None:
+            return {}
+
+        clean_body = self._strip_raise_guards(spec.ast_node.body)
+        safe_consts = {
+            k: v for k, v in self.module_constants.items()
+            if isinstance(v, (int, float)) and math.isfinite(float(v))
+        }
+        compiler = ASTFunctionToSymPy({}, safe_consts, self._helper_ast_map)
+        for p in spec.params:
+            compiler.env[p] = sp.Symbol(p, real=True)
+        if seed_env:
+            compiler.env.update(seed_env)
+
+        keep_map = keep_symbols if keep_symbols is not None else {}
+        results: Dict[str, Tuple[sp.Expr, int]] = {}
+
+        for stmt in clean_body:
+            if (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+            ):
+                continue
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                tgt = stmt.targets[0]
+                if isinstance(tgt, ast.Name):
+                    var_name = tgt.id
+                    try:
+                        val_expr = compiler.eval_expr(stmt.value)
+                    except Exception:
+                        continue
+                    if var_name in keep_map:
+                        export_id = keep_map[var_name]
+                        results[export_id] = (val_expr, getattr(stmt, "lineno", spec.lineno))
+                        compiler.env[var_name] = sp.Symbol(export_id, real=True)
+                    else:
+                        compiler.env[var_name] = val_expr
+                elif (
+                    isinstance(tgt, ast.Tuple)
+                    and isinstance(stmt.value, ast.Name)
+                    and stmt.value.id in compiler.env
+                    and isinstance(compiler.env[stmt.value.id], (tuple, list))
+                ):
+                    seq_val = compiler.env[stmt.value.id]
+                    if len(tgt.elts) == len(seq_val):
+                        for elt, item_v in zip(tgt.elts, seq_val, strict=True):
+                            if isinstance(elt, ast.Name):
+                                compiler.env[elt.id] = item_v
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                var_name = stmt.target.id
+                try:
+                    val_expr = compiler.eval_expr(stmt.value)
+                except Exception:
+                    continue
+                if var_name in keep_map:
+                    export_id = keep_map[var_name]
+                    results[export_id] = (val_expr, getattr(stmt, "lineno", spec.lineno))
+                    compiler.env[var_name] = sp.Symbol(export_id, real=True)
+                else:
+                    compiler.env[var_name] = val_expr
+            elif isinstance(stmt, ast.Return) and stmt.value is not None:
+                try:
+                    ret_expr = compiler.eval_expr(stmt.value)
+                    results["__return__"] = (ret_expr, getattr(stmt, "lineno", spec.lineno))
+                except Exception:
+                    pass
+
+        return results
+
+    def build_safe_simulation_callable(
+        self,
+        fn_name: str,
+        max_loop_steps: int = 50_000,
+    ) -> Optional[Callable[..., Any]]:
+        """Construye un intérprete AST puro y acotado para simulaciones discretas sin usar `exec`/`eval`."""
+        spec = self.functions.get(fn_name)
+        if spec is None:
+            return None
+        safe_consts = dict(self.module_constants)
+        fn_node = spec.ast_node
+        arg_names = [a.arg for a in fn_node.args.args]
+        defaults_map = dict(spec.defaults)
+
+        def _safe_callable(*args: Any, **kwargs: Any) -> Any:
+            env: Dict[str, Any] = dict(safe_consts)
+            for idx, a_name in enumerate(arg_names):
+                if idx < len(args):
+                    env[a_name] = args[idx]
+                elif a_name in kwargs:
+                    env[a_name] = kwargs[a_name]
+                elif a_name in defaults_map:
+                    env[a_name] = defaults_map[a_name]
+                else:
+                    raise TypeError(f"Missing required argument '{a_name}' for '{fn_name}'.")
+            interp = _SafeSimulationASTInterpreter(env=env, max_loop_steps=max_loop_steps)
+            return interp.run_body(fn_node.body)
+
+        return _safe_callable
+
+
+class _ReturnSignal(Exception):
+    """Señal interna de retorno para `_SafeSimulationASTInterpreter`."""
+
+    def __init__(self, value: Any):
+        super().__init__()
+        self.value = value
+
+
+_SAFE_AST_BUILTINS: Dict[str, Callable[..., Any]] = {
+    "abs": abs,
+    "bool": bool,
+    "enumerate": enumerate,
+    "float": float,
+    "int": int,
+    "len": len,
+    "max": max,
+    "min": min,
+    "range": range,
+    "round": round,
+    "sum": sum,
+    "ValueError": ValueError,
+}
+
+_SAFE_MATH_ATTRS: Dict[str, Callable[..., Any]] = {
+    "ceil": math.ceil,
+    "cos": math.cos,
+    "exp": math.exp,
+    "fabs": math.fabs,
+    "floor": math.floor,
+    "isfinite": math.isfinite,
+    "log": math.log,
+    "log1p": math.log1p,
+    "pow": math.pow,
+    "sin": math.sin,
+    "sqrt": math.sqrt,
+    "tanh": math.tanh,
+}
+
+
+class _SafeSimulationASTInterpreter:
+    """Intérprete estático de subconjunto imperativo puro sobre AST de función (cero ejecución de top-level)."""
+
+    def __init__(self, env: Dict[str, Any], max_loop_steps: int = 50_000):
+        self.env = env
+        self.max_loop_steps = max_loop_steps
+        self._steps = 0
+
+    def _tick(self) -> None:
+        self._steps += 1
+        if self._steps > self.max_loop_steps:
+            raise RuntimeError(f"Safe AST simulation exceeded step budget ({self.max_loop_steps}).")
+
+    def _bind_target(self, target: ast.AST, value: Any, env: Dict[str, Any]) -> None:
+        if isinstance(target, ast.Name):
+            if target.id.startswith("__"):
+                raise ValueError(f"Disallowed identifier '{target.id}' in safe AST interpreter.")
+            env[target.id] = value
+            return
+        if isinstance(target, (ast.Tuple, ast.List)):
+            seq = list(value)
+            if len(target.elts) != len(seq):
+                raise ValueError("Tuple unpacking length mismatch in safe AST interpreter.")
+            for elt, v in zip(target.elts, seq, strict=True):
+                self._bind_target(elt, v, env)
+            return
+        if isinstance(target, ast.Subscript):
+            container = self.eval_expr(target.value, env)
+            key = self.eval_expr(target.slice, env)
+            if isinstance(container, (list, dict)):
+                container[key] = value
+                return
+        raise ValueError(f"Unsupported assignment target in safe AST interpreter: {type(target).__name__}")
+
+    def _apply_augop(self, op: ast.operator, lhs: Any, rhs: Any) -> Any:
+        if isinstance(op, ast.Add):
+            return lhs + rhs
+        if isinstance(op, ast.Sub):
+            return lhs - rhs
+        if isinstance(op, ast.Mult):
+            return lhs * rhs
+        if isinstance(op, ast.Div):
+            return lhs / rhs
+        if isinstance(op, ast.FloorDiv):
+            return lhs // rhs
+        if isinstance(op, ast.Mod):
+            return lhs % rhs
+        if isinstance(op, ast.Pow):
+            return lhs ** rhs
+        raise ValueError(f"Unsupported binary/augmented operator: {type(op).__name__}")
+
+    def eval_expr(self, node: ast.AST, env: Dict[str, Any]) -> Any:
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id.startswith("__"):
+                raise ValueError(f"Disallowed identifier '{node.id}'.")
+            if node.id in env:
+                return env[node.id]
+            if node.id in _SAFE_AST_BUILTINS:
+                return _SAFE_AST_BUILTINS[node.id]
+            raise NameError(f"Unknown identifier '{node.id}' in safe AST simulation.")
+        if isinstance(node, ast.List):
+            return [self.eval_expr(e, env) for e in node.elts]
+        if isinstance(node, ast.Tuple):
+            return tuple(self.eval_expr(e, env) for e in node.elts)
+        if isinstance(node, ast.Dict):
+            return {
+                self.eval_expr(k, env): self.eval_expr(v, env)
+                for k, v in zip(node.keys, node.values, strict=True)
+                if k is not None
+            }
+        if isinstance(node, ast.Subscript):
+            container = self.eval_expr(node.value, env)
+            sl = node.slice
+            if isinstance(sl, ast.Slice):
+                lo = self.eval_expr(sl.lower, env) if sl.lower is not None else None
+                hi = self.eval_expr(sl.upper, env) if sl.upper is not None else None
+                st = self.eval_expr(sl.step, env) if sl.step is not None else None
+                return container[slice(lo, hi, st)]
+            idx = self.eval_expr(sl, env)
+            return container[idx]
+        if isinstance(node, ast.UnaryOp):
+            val = self.eval_expr(node.operand, env)
+            if isinstance(node.op, ast.USub):
+                return -val
+            if isinstance(node.op, ast.UAdd):
+                return +val
+            if isinstance(node.op, ast.Not):
+                return not val
+            raise ValueError(f"Unsupported unary operator: {type(node.op).__name__}")
+        if isinstance(node, ast.BinOp):
+            return self._apply_augop(node.op, self.eval_expr(node.left, env), self.eval_expr(node.right, env))
+        if isinstance(node, ast.BoolOp):
+            if isinstance(node.op, ast.And):
+                res = True
+                for v_node in node.values:
+                    res = self.eval_expr(v_node, env)
+                    if not res:
+                        return res
+                return res
+            if isinstance(node.op, ast.Or):
+                res = False
+                for v_node in node.values:
+                    res = self.eval_expr(v_node, env)
+                    if res:
+                        return res
+                return res
+        if isinstance(node, ast.Compare):
+            left = self.eval_expr(node.left, env)
+            for op, comp_node in zip(node.ops, node.comparators, strict=True):
+                right = self.eval_expr(comp_node, env)
+                if isinstance(op, ast.Eq):
+                    ok = left == right
+                elif isinstance(op, ast.NotEq):
+                    ok = left != right
+                elif isinstance(op, ast.Lt):
+                    ok = left < right
+                elif isinstance(op, ast.LtE):
+                    ok = left <= right
+                elif isinstance(op, ast.Gt):
+                    ok = left > right
+                elif isinstance(op, ast.GtE):
+                    ok = left >= right
+                elif isinstance(op, ast.In):
+                    ok = left in right
+                elif isinstance(op, ast.NotIn):
+                    ok = left not in right
+                else:
+                    raise ValueError(f"Unsupported comparison operator: {type(op).__name__}")
+                if not ok:
+                    return False
+                left = right
+            return True
+        if isinstance(node, ast.IfExp):
+            return (
+                self.eval_expr(node.body, env)
+                if self.eval_expr(node.test, env)
+                else self.eval_expr(node.orelse, env)
+            )
+        if isinstance(node, (ast.ListComp, ast.GeneratorExp)):
+            return self._eval_comp(node.elt, node.generators, env)
+        if isinstance(node, ast.Call):
+            args = [self.eval_expr(a, env) for a in node.args]
+            kwargs = {kw.arg: self.eval_expr(kw.value, env) for kw in node.keywords if kw.arg is not None}
+            if isinstance(node.func, ast.Name) and node.func.id in _SAFE_AST_BUILTINS:
+                return _SAFE_AST_BUILTINS[node.func.id](*args, **kwargs)
+            if isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                if isinstance(node.func.value, ast.Name) and node.func.value.id in ("math", "np", "numpy"):
+                    if attr in _SAFE_MATH_ATTRS:
+                        return _SAFE_MATH_ATTRS[attr](*args, **kwargs)
+                recv = self.eval_expr(node.func.value, env)
+                if isinstance(recv, list) and attr == "append" and len(args) == 1 and not kwargs:
+                    recv.append(args[0])
+                    return None
+                if isinstance(recv, dict) and attr == "get" and 1 <= len(args) <= 2 and not kwargs:
+                    return recv.get(*args)
+            raise ValueError(f"Disallowed call in safe AST simulation: {ast.dump(node.func)}")
+        raise ValueError(f"Unsupported AST expression in safe simulation: {type(node).__name__}")
+
+    def _eval_comp(self, elt: ast.AST, generators: List[ast.comprehension], base_env: Dict[str, Any]) -> List[Any]:
+        def _step(idx: int, cur_env: Dict[str, Any]) -> List[Any]:
+            if idx >= len(generators):
+                self._tick()
+                return [self.eval_expr(elt, cur_env)]
+            gen = generators[idx]
+            it_vals = self.eval_expr(gen.iter, cur_env)
+            out: List[Any] = []
+            for item in it_vals:
+                self._tick()
+                next_env = dict(cur_env)
+                self._bind_target(gen.target, item, next_env)
+                if all(bool(self.eval_expr(cond, next_env)) for cond in gen.ifs):
+                    out.extend(_step(idx + 1, next_env))
+            return out
+
+        return _step(0, dict(base_env))
+
+    def exec_stmt(self, stmt: ast.stmt) -> None:
+        self._tick()
+        if isinstance(stmt, ast.Expr):
+            if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+                return
+            self.eval_expr(stmt.value, self.env)
+            return
+        if isinstance(stmt, ast.Pass):
+            return
+        if isinstance(stmt, ast.Assign):
+            val = self.eval_expr(stmt.value, self.env)
+            for tgt in stmt.targets:
+                self._bind_target(tgt, val, self.env)
+            return
+        if isinstance(stmt, ast.AnnAssign):
+            if stmt.value is not None:
+                val = self.eval_expr(stmt.value, self.env)
+                self._bind_target(stmt.target, val, self.env)
+            return
+        if isinstance(stmt, ast.AugAssign):
+            if isinstance(stmt.target, ast.Name):
+                cur = self.eval_expr(stmt.target, self.env)
+                rhs = self.eval_expr(stmt.value, self.env)
+                self._bind_target(stmt.target, self._apply_augop(stmt.op, cur, rhs), self.env)
+                return
+            if isinstance(stmt.target, ast.Subscript):
+                container = self.eval_expr(stmt.target.value, self.env)
+                key = self.eval_expr(stmt.target.slice, self.env)
+                rhs = self.eval_expr(stmt.value, self.env)
+                container[key] = self._apply_augop(stmt.op, container[key], rhs)
+                return
+            raise ValueError(f"Unsupported AugAssign target: {type(stmt.target).__name__}")
+        if isinstance(stmt, ast.If):
+            branch = stmt.body if self.eval_expr(stmt.test, self.env) else stmt.orelse
+            for s in branch:
+                self.exec_stmt(s)
+            return
+        if isinstance(stmt, ast.For):
+            iterable = self.eval_expr(stmt.iter, self.env)
+            for item in iterable:
+                self._tick()
+                self._bind_target(stmt.target, item, self.env)
+                for s in stmt.body:
+                    self.exec_stmt(s)
+            return
+        if isinstance(stmt, ast.Raise):
+            if stmt.exc is not None:
+                exc_obj = self.eval_expr(stmt.exc, self.env)
+                if isinstance(exc_obj, BaseException):
+                    raise exc_obj
+            raise ValueError("Precondition guard triggered in safe AST simulation.")
+        if isinstance(stmt, ast.Return):
+            ret_val = self.eval_expr(stmt.value, self.env) if stmt.value is not None else None
+            raise _ReturnSignal(ret_val)
+        raise ValueError(f"Unsupported AST statement in safe simulation: {type(stmt).__name__}")
+
+    def run_body(self, stmts: List[ast.stmt]) -> Any:
+        try:
+            for s in stmts:
+                self.exec_stmt(s)
+        except _ReturnSignal as sig:
+            return sig.value
+        return None
 
 
 def detect_pressure_attempt(ctx: QueryContext) -> bool:

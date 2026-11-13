@@ -1,12 +1,12 @@
 """Adaptador de ingesta estática AST y despacho cuadrático KKT para `economic_dispatch`."""
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
+import sympy as sp
 
 from ..schema import CausalGraph, Constraint
 from ..solver import solve_problem
@@ -52,6 +52,7 @@ class DispatchCausalAdapter:
     """Compila estáticamente `economic_dispatch` (`ThermalGenerator` y `solve_economic_dispatch`) a QP CGE."""
 
     REPO_ID = "economic_dispatch"
+    SUBMODELS: Tuple[str, ...] = ("dispatch",)
 
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
@@ -185,23 +186,45 @@ class DispatchCausalAdapter:
             nodes.append(make_verified_node(c_id, "exogenous", gen_file, c_id, 19, current_value=g.c))
 
             if fuel_sym is not None:
-                import sympy as sp
-                c_expr = str(
-                    fuel_sym.subs({
-                        sp.Symbol("a", real=True): sp.Symbol(a_id, real=True),
-                        sp.Symbol("b", real=True): sp.Symbol(b_id, real=True),
-                        sp.Symbol("c", real=True): sp.Symbol(c_id, real=True),
-                        sp.Symbol("power", real=True): sp.Symbol(p_var, real=True),
-                    })
+                c_sym_sub = fuel_sym.subs({
+                    sp.Symbol("a", real=True): sp.Symbol(a_id, real=True),
+                    sp.Symbol("b", real=True): sp.Symbol(b_id, real=True),
+                    sp.Symbol("c", real=True): sp.Symbol(c_id, real=True),
+                    sp.Symbol("power", real=True): sp.Symbol(p_var, real=True),
+                })
+                c_expr = str(c_sym_sub)
+                c_nom_val = float(
+                    c_sym_sub.evalf(
+                        subs={
+                            sp.Symbol(a_id, real=True): g.a,
+                            sp.Symbol(b_id, real=True): g.b,
+                            sp.Symbol(c_id, real=True): g.c,
+                            sp.Symbol(p_var, real=True): p0,
+                        }
+                    )
                 )
             else:
                 c_expr = f"{a_id} * ({p_var}**2) + {b_id} * {p_var} + {c_id}"
+                c_nom_val = g.a * (p0 ** 2) + g.b * p0 + g.c
 
             c_node_id = f"cost_{g.id}"
-            nodes.append(make_verified_node(c_node_id, "state", gen_file, "fuel_cost", 29, symbolic_expr=c_expr))
+            nodes.append(
+                make_verified_node(
+                    c_node_id,
+                    "state",
+                    gen_file,
+                    "fuel_cost",
+                    29,
+                    current_value=c_nom_val,
+                    symbolic_expr=c_expr,
+                )
+            )
             edges.extend([(p_var, c_node_id), (a_id, c_node_id), (b_id, c_node_id), (c_id, c_node_id), (c_node_id, "total_fuel_cost")])
             cost_terms.append(c_node_id)
 
+        tot_nom_cost = sum(
+            float(n.current_value) for n in nodes if n.id in set(cost_terms) and isinstance(n.current_value, (int, float))
+        )
         nodes.append(
             make_verified_node(
                 "total_fuel_cost",
@@ -209,6 +232,7 @@ class DispatchCausalAdapter:
                 disp_file,
                 "solve_economic_dispatch",
                 52,
+                current_value=tot_nom_cost,
                 symbolic_expr=" + ".join(cost_terms),
             )
         )
@@ -225,6 +249,13 @@ class DispatchCausalAdapter:
             nodes=nodes,
             edges=edges,
             constraints=constraints,
+            metadata={
+                "sense": "min",
+                "repo_id": self.REPO_ID,
+                "submodel": "dispatch",
+                "available_submodels": list(self.SUBMODELS),
+                "source_path": self.repo_path,
+            },
         )
 
     def _solve_dispatch_exact_kkt(self, fleet: List[GenSpec], load_demand: float) -> Dict[str, Any]:
@@ -433,7 +464,6 @@ class DispatchCausalAdapter:
         cur_p = dict(extract_inline_numeric_assignments(ctx.prompt))
         cur_p.update(ctx.parameters)
         p_low = normalize_math_unicode(ctx.prompt.lower()).replace("economic_dispatch", " ")
-        p_clean = re.sub(r"\b[a-z_][a-z0-9_]*\s*=\s*[-+]?\d+(?:[\.,]\d+)?(?:e[-+]?\d+)?\b", " ", p_low)
         target_clause, wrt_clause, explicit_pair = split_sensitivity_clauses(ctx.prompt)
         exp_num = (explicit_pair[0] if explicit_pair else "").strip().lower().rstrip("*")
         exp_den = (explicit_pair[1] if explicit_pair else "").strip().lower().rstrip("*")
@@ -446,7 +476,6 @@ class DispatchCausalAdapter:
             a = float(cur_p.get("a", 0.004))
             b = float(cur_p.get("b", 5.0))
             pwr = float(cur_p.get("power", cur_p.get("P", 100.0)))
-            wc_u = wrt_clause if wrt_clause else p_clean
             asks_mc_tgt = (
                 raw_target in ("marginal_cost", "mc")
                 or exp_num in ("mc", "marginal_cost")
@@ -533,7 +562,6 @@ class DispatchCausalAdapter:
                 break
 
         # Resolver parámetro respecto al que se deriva (`load_demand`, `a_i`, `b_i`, `c_i`, `p_max_i`, `p_min_i`)
-        wc_d = wrt_clause if wrt_clause else p_clean
         wrt_kind = "load_demand"
         wrt_gen_idx: Optional[int] = None
 
@@ -1083,3 +1111,52 @@ class DispatchCausalAdapter:
             confidence_claim="UNSUPPORTED_DOMAIN",
             raw_answer=f"Consulta '{q}' no soportada.",
         )
+
+    def list_submodels(self) -> List[str]:
+        return list(self.SUBMODELS)
+
+    def default_submodel(self) -> str:
+        return "dispatch"
+
+    def infer_submodel(
+        self,
+        target_id: Optional[str] = None,
+        actor_hints: Optional[Sequence[str]] = None,
+        file_hint: Optional[str] = None,
+    ) -> str:
+        return "dispatch"
+
+    def build_causal_graph(
+        self,
+        submodel: Optional[str] = None,
+        target_hint: Optional[str] = None,
+        actor_hints: Optional[Sequence[str]] = None,
+        file_hint: Optional[str] = None,
+    ) -> CausalGraph:
+        """Compila la flota térmica de `economic_dispatch` desde el AST vivo a `CausalGraph` QP."""
+        chosen = (submodel or "").strip() or self.infer_submodel(
+            target_id=target_hint,
+            actor_hints=actor_hints,
+            file_hint=file_hint,
+        )
+        if chosen not in self.SUBMODELS:
+            raise ValueError(
+                f"Unknown submodel '{chosen}' for '{self.REPO_ID}'. Available submodels: {list(self.SUBMODELS)}"
+            )
+        raw_mod_fleet = self.extractor.module_constants.get("DEFAULT_FLEET")
+        if isinstance(raw_mod_fleet, (list, tuple)) and len(raw_mod_fleet) > 0 and isinstance(raw_mod_fleet[0], dict):
+            fleet = [
+                GenSpec(
+                    id=str(item.get("id", f"G{idx}")),
+                    a=float(item.get("a", 0.0)),
+                    b=float(item.get("b", 0.0)),
+                    c=float(item.get("c", 0.0)),
+                    p_min=float(item.get("p_min", 0.0)),
+                    p_max=float(item.get("p_max", 1e6)),
+                )
+                for idx, item in enumerate(raw_mod_fleet, 1)
+            ]
+        else:
+            fleet = list(DEFAULT_FLEET)
+        load_default = float(self.extractor.module_constants.get("DEFAULT_LOAD_DEMAND", 300.0))
+        return self._build_dispatch_qp_ir(fleet=fleet, load_demand=load_default)

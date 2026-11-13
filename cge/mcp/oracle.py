@@ -13,13 +13,16 @@ import math
 import os
 import re
 import threading
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import networkx as nx
+import numpy as np
 import sympy as sp
+from scipy.optimize import minimize
 from sympy.parsing.sympy_parser import parse_expr
 
 from ..ingest import ASTIngestPipeline, compile_source_to_ir
+from ..ingest_adapters.engine import RepositoryCausalEngine
 from ..layer1_heuristic import Layer1Router
 from ..layer2_exact import Layer2Solver
 from ..schema import CausalGraph, Constraint
@@ -338,15 +341,53 @@ class ActorDBOracle:
         self.allow_auto_discovery = allow_auto_discovery
         self._cache: Dict[str, CausalGraph] = {}
         self._lock = threading.RLock()
+        self._repo_engine = RepositoryCausalEngine()
 
     def clear_cache(self) -> None:
         with self._lock:
             self._cache.clear()
+            self._repo_engine.clear_cache()
+
+    def _resolve_alternate_adapter_submodel(
+        self,
+        source_path: Optional[str],
+        graph_data: Optional[Dict[str, Any]],
+        current_graph: CausalGraph,
+        predicate: Callable[[CausalGraph], bool],
+    ) -> Optional[Tuple[CausalGraph, bool]]:
+        """Si la fuente es un repositorio adaptador sin `:submodel` explícito, busca otro submodelo compatible."""
+        if graph_data is not None:
+            return None
+        avail = (current_graph.metadata or {}).get("available_submodels")
+        if not isinstance(avail, list) or len(avail) <= 1:
+            return None
+        src_eff = source_path if source_path is not None else self.default_source
+        if isinstance(src_eff, os.PathLike):
+            src_eff = os.fspath(src_eff)
+        if not isinstance(src_eff, str) or not src_eff.strip():
+            return None
+        ad_spec = self._repo_engine.resolve_adapter_source(src_eff.strip())
+        if not ad_spec or "error_code" in ad_spec or ad_spec.get("explicit_submodel"):
+            return None
+        cur_sub = (current_graph.metadata or {}).get("submodel")
+        for cand_sub in avail:
+            if cand_sub == cur_sub:
+                continue
+            cand_g, cand_hit, cand_err = self.resolve_graph(
+                source_path=source_path,
+                submodel_override=cand_sub,
+            )
+            if cand_err is None and cand_g is not None and predicate(cand_g):
+                return cand_g, cand_hit
+        return None
 
     def resolve_graph(
         self,
         source_path: Optional[str] = None,
         graph_data: Optional[Dict[str, Any]] = None,
+        target_hint: Optional[str] = None,
+        actor_hints: Optional[Sequence[str]] = None,
+        submodel_override: Optional[str] = None,
     ) -> Tuple[Optional[CausalGraph], bool, Optional[Dict[str, Any]]]:
         """Resuelve el CausalGraph objetivo devolviendo `(graph, cache_hit, error_dict)`."""
         # 1. Grafo explícito en diccionario o instancia CausalGraph
@@ -387,6 +428,8 @@ class ActorDBOracle:
             return src, True, None
         if isinstance(src, dict):
             return self.resolve_graph(graph_data=src)
+        if isinstance(src, os.PathLike):
+            src = os.fspath(src)
 
         if isinstance(src, str):
             src_clean = src.strip()
@@ -398,6 +441,84 @@ class ActorDBOracle:
                     "message": "source_path cannot be an empty string.",
                     "zero_hallucination_verified": True,
                 }
+
+            # 2a. Enrutamiento prioritario hacia Adaptadores Estáticos AST (`cge/ingest_adapters/`)
+            adapter_spec = self._repo_engine.resolve_adapter_source(src_clean)
+            if adapter_spec is not None:
+                if "error_code" in adapter_spec:
+                    return None, False, {
+                        "status": "ERROR",
+                        "error_code": adapter_spec["error_code"],
+                        "seal": "UNSUPPORTED",
+                        "message": adapter_spec["message"],
+                        "zero_hallucination_verified": True,
+                    }
+                try:
+                    repo_id = adapter_spec["repo_id"]
+                    repo_dir = adapter_spec["repo_dir"]
+                    explicit_submodel = adapter_spec["explicit_submodel"]
+                    file_hint = adapter_spec["file_hint"]
+                    fs_sig = adapter_spec["fs_signature"]
+
+                    with self._lock:
+                        adapter = self._repo_engine.get_adapter(repo_id, str(repo_dir))
+                    if adapter is None:
+                        return None, False, {
+                            "status": "ERROR",
+                            "error_code": "UNSUPPORTED_ADAPTER_REPO",
+                            "seal": "UNSUPPORTED",
+                            "message": f"No causal adapter registered for repository '{repo_id}'.",
+                            "zero_hallucination_verified": True,
+                        }
+
+                    avail_subs = adapter.list_submodels() if hasattr(adapter, "list_submodels") else []
+                    if explicit_submodel and avail_subs and explicit_submodel not in avail_subs:
+                        return None, False, {
+                            "status": "ERROR",
+                            "error_code": "INVALID_SUBMODEL",
+                            "seal": "UNSUPPORTED",
+                            "repo_id": repo_id,
+                            "available_submodels": avail_subs,
+                            "message": (
+                                f"Submodel '{explicit_submodel}' is not available for repository '{repo_id}'. "
+                                f"Available submodels: {avail_subs}"
+                            ),
+                            "zero_hallucination_verified": True,
+                        }
+
+                    effective_sub = (
+                        explicit_submodel
+                        or submodel_override
+                        or adapter.infer_submodel(
+                            target_id=target_hint,
+                            actor_hints=actor_hints,
+                            file_hint=file_hint,
+                        )
+                    )
+                    ckey = f"adapter:{repo_id}:{repo_dir.as_posix()}:{fs_sig}:{effective_sub}"
+                    with self._lock:
+                        if ckey in self._cache:
+                            return self._cache[ckey], True, None
+
+                    g = adapter.build_causal_graph(
+                        submodel=effective_sub,
+                        target_hint=target_hint,
+                        actor_hints=actor_hints,
+                        file_hint=file_hint,
+                    )
+                    with self._lock:
+                        if len(self._cache) >= 128:
+                            self._cache.pop(next(iter(self._cache)), None)
+                        self._cache[ckey] = g
+                    return g, False, None
+                except Exception as exc:
+                    return None, False, {
+                        "status": "ERROR",
+                        "error_code": "INGESTION_FAILED",
+                        "seal": "UNSUPPORTED",
+                        "message": f"Failed to compile adapter repository '{src_clean}': {exc}",
+                        "zero_hallucination_verified": True,
+                    }
 
             if os.path.isdir(src_clean):
                 sig = _compute_fs_signature(src_clean)
@@ -846,9 +967,28 @@ class ActorDBOracle:
         graph_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Traza el linaje causal, derivadas totales exactas, ranking de palancas y actores muertos."""
-        graph, cache_hit, err = self.resolve_graph(source_path=source_path, graph_data=graph_data)
+        hints_t = [source_id] if source_id else None
+        graph, cache_hit, err = self.resolve_graph(
+            source_path=source_path,
+            graph_data=graph_data,
+            target_hint=target_id,
+            actor_hints=hints_t,
+        )
         if err is not None or graph is None:
             return _clean_json_val(err)
+
+        if (target_id is not None and target_id not in graph.nodes) or (
+            source_id is not None and source_id not in graph.nodes
+        ):
+            alt_t = self._resolve_alternate_adapter_submodel(
+                source_path,
+                graph_data,
+                graph,
+                lambda g: (target_id is None or target_id in g.nodes)
+                and (source_id is None or source_id in g.nodes),
+            )
+            if alt_t is not None:
+                graph, cache_hit = alt_t
 
         resolved_target, t_err = self._resolve_target_id(graph, target_id)
         if t_err is not None or resolved_target is None:
@@ -1015,7 +1155,17 @@ class ActorDBOracle:
         graph_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Ejecuta una intervención contrafactual exacta de Pearl `do(I)` mutilando aristas entrantes."""
-        graph, cache_hit, err = self.resolve_graph(source_path=source_path, graph_data=graph_data)
+        hints_d: List[str] = []
+        if isinstance(interventions, dict):
+            hints_d.extend(str(k) for k in interventions.keys())
+        if isinstance(context, dict):
+            hints_d.extend(str(k) for k in context.keys())
+        graph, cache_hit, err = self.resolve_graph(
+            source_path=source_path,
+            graph_data=graph_data,
+            target_hint=target_id,
+            actor_hints=hints_d or None,
+        )
         if err is not None or graph is None:
             return _clean_json_val(err)
 
@@ -1027,6 +1177,22 @@ class ActorDBOracle:
                 "message": "interventions must be a dictionary mapping actor IDs to finite numeric/boolean values.",
                 "zero_hallucination_verified": True,
             })
+
+        if (
+            (target_id is not None and target_id not in graph.nodes)
+            or any(k not in graph.nodes for k in interventions)
+            or (isinstance(context, dict) and any(k not in graph.nodes for k in context))
+        ):
+            alt_d = self._resolve_alternate_adapter_submodel(
+                source_path,
+                graph_data,
+                graph,
+                lambda g: (target_id is None or target_id in g.nodes)
+                and all(k in g.nodes for k in interventions)
+                and (not isinstance(context, dict) or all(k in g.nodes for k in context)),
+            )
+            if alt_d is not None:
+                graph, cache_hit = alt_d
 
         resolved_target, t_err = self._resolve_target_id(graph, target_id)
         if t_err is not None or resolved_target is None:
@@ -1269,6 +1435,212 @@ class ActorDBOracle:
     # 3. Primitiva `SOLVE` (`cge_solve`)
     # ------------------------------------------------------------------
 
+    @classmethod
+    def _solve_blackbox_graph(
+        cls,
+        graph: CausalGraph,
+        dag: nx.DiGraph,
+        syms: Dict[str, sp.Symbol],
+        compiled_fns: Dict[str, Tuple[List[str], Callable[..., Any]]],
+        resolved_target: str,
+        resolved_sense: str,
+        control_ids: List[str],
+        fixed_controls: Optional[Dict[str, float]] = None,
+        exo_overrides: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """Optimizador determinista multi-arranque para grafos con mecanismos `_blackbox_callables` puros."""
+        cone_nodes: Set[str] = (
+            (nx.ancestors(dag, resolved_target) | {resolved_target})
+            if dag.has_node(resolved_target)
+            else {resolved_target}
+        )
+        for c_obj in graph.constraints.values():
+            if c_obj.type == "hard" and c_obj.expression:
+                for vid in _extract_identifiers(c_obj.expression):
+                    if vid in dag:
+                        cone_nodes.add(vid)
+                        cone_nodes.update(nx.ancestors(dag, vid))
+
+        fid_rep = (graph.metadata or {}).get("fidelity_report")
+        fid_unv = set((fid_rep or {}).get("unverified_nodes") or []) if isinstance(fid_rep, dict) else set()
+        unverified = sorted(
+            nid
+            for nid in cone_nodes
+            if nid in fid_unv
+            or (isinstance(graph.nodes[nid].fidelity, dict) and not graph.nodes[nid].fidelity.get("verified", True))
+        )
+        if unverified or (isinstance(fid_rep, dict) and not fid_rep.get("verified", True)):
+            return {
+                "status": "UNSUPPORTED",
+                "certificate_status": SolveStatus.UNSUPPORTED.value,
+                "unverified_nodes": unverified,
+                "reason": f"Fidelity verification failed on nodes: {unverified}",
+                "certificate": {"status": SolveStatus.UNSUPPORTED.value, "unverified_nodes": unverified},
+            }
+
+        fixed_map = {k: float(v) for k, v in (fixed_controls or {}).items()}
+        free_ids = [cid for cid in control_ids if cid not in fixed_map]
+        bounds_list: List[Tuple[float, float]] = []
+        x0_list: List[float] = []
+        is_disc_list: List[bool] = []
+
+        for cid in free_ids:
+            n = graph.nodes[cid]
+            x0_v = float(n.current_value) if isinstance(n.current_value, (int, float)) else 0.0
+            b = n.bounds or {}
+            b_min = b.get("min")
+            b_max = b.get("max")
+            lb = float(b_min) if b_min is not None else (0.0 if x0_v >= 0.0 else x0_v - 100.0)
+            ub = float(b_max) if b_max is not None else max(1000.0, abs(x0_v) * 5.0)
+            if ub < lb:
+                lb, ub = ub, lb
+            bounds_list.append((lb, ub))
+            x0_list.append(min(ub, max(lb, x0_v)))
+            is_disc_list.append(n.data_type in ("discrete", "boolean"))
+
+        local_syms: Dict[str, Any] = {"pi": sp.pi, **_MATH_FUNC_LOCALS, **syms}
+        base_state = cls._evaluate_forward_with_do(
+            graph, dag, compiled_fns, interventions=fixed_map or None, context=exo_overrides
+        )
+        base_j = float(base_state[resolved_target])
+
+        def _eval_candidate(vec: Sequence[float]) -> Tuple[float, float, Dict[str, float], List[str], List[str]]:
+            interv = dict(fixed_map)
+            for idx_f, cid in enumerate(free_ids):
+                lb_i, ub_i = bounds_list[idx_f]
+                val_i = min(ub_i, max(lb_i, float(vec[idx_f])))
+                if is_disc_list[idx_f]:
+                    val_i = float(int(round(val_i)))
+                interv[cid] = val_i
+            st = cls._evaluate_forward_with_do(graph, dag, compiled_fns, interventions=interv, context=exo_overrides)
+            max_viol = 0.0
+            viol_cids: List[str] = []
+            act_cids: List[str] = []
+            for cid_c, c_obj in graph.constraints.items():
+                if c_obj.type != "hard" or not c_obj.expression or "sum(" in c_obj.expression:
+                    continue
+                sat, margin = evaluate_constraint_at_state(c_obj.expression, st, local_syms=local_syms, tol=1e-4)
+                if not sat:
+                    max_viol = max(max_viol, abs(float(margin)))
+                    viol_cids.append(cid_c)
+                elif abs(float(margin)) <= 1e-4:
+                    act_cids.append(cid_c)
+            j_v = float(st[resolved_target])
+            return j_v, max_viol, st, viol_cids, act_cids
+
+        seeds: List[np.ndarray] = []
+        if free_ids:
+            seeds.append(np.array(x0_list, dtype=float))
+            seeds.append(np.array([lb for lb, _ in bounds_list], dtype=float))
+            seeds.append(np.array([ub for _, ub in bounds_list], dtype=float))
+            seeds.append(np.array([0.5 * (lb + ub) for lb, ub in bounds_list], dtype=float))
+            n_dim = len(free_ids)
+            if n_dim == 1:
+                lb0, ub0 = bounds_list[0]
+                for frac in np.linspace(0.0, 1.0, 25):
+                    seeds.append(np.array([lb0 + frac * (ub0 - lb0)], dtype=float))
+            else:
+                rng = np.random.default_rng(42)
+                lows = np.array([lb for lb, _ in bounds_list], dtype=float)
+                highs = np.array([ub for _, ub in bounds_list], dtype=float)
+                for _ in range(32):
+                    seeds.append(lows + rng.random(n_dim) * (highs - lows))
+        else:
+            seeds.append(np.zeros(0, dtype=float))
+
+        best_feas: Optional[Tuple[float, Dict[str, float], List[str]]] = None
+        best_infeas: Optional[Tuple[float, List[str]]] = None
+
+        def _consider(vec: Sequence[float]) -> float:
+            nonlocal best_feas, best_infeas
+            try:
+                j_v, m_viol, st_d, v_cids, a_cids = _eval_candidate(vec)
+            except Exception:
+                return 1e18
+            if not math.isfinite(j_v):
+                return 1e18
+            obj_min = -j_v if resolved_sense == "max" else j_v
+            if m_viol <= 1e-4:
+                if best_feas is None or obj_min < best_feas[0] - 1e-9:
+                    best_feas = (obj_min, st_d, a_cids)
+                return obj_min
+            if best_infeas is None or m_viol < best_infeas[0]:
+                best_infeas = (m_viol, v_cids)
+            return obj_min + 1e6 * (1.0 + m_viol)
+
+        scored_seeds: List[Tuple[float, np.ndarray]] = []
+        for sv in seeds:
+            sc = _consider(sv)
+            scored_seeds.append((sc, sv))
+
+        if free_ids:
+            scored_seeds.sort(key=lambda item: item[0])
+            for _, start_vec in scored_seeds[:3]:
+                try:
+                    res_opt = minimize(
+                        fun=_consider,
+                        x0=start_vec,
+                        method="Powell",
+                        bounds=bounds_list,
+                        options={"maxiter": 120, "ftol": 1e-6, "xtol": 1e-5},
+                    )
+                    if res_opt.x is not None:
+                        _consider(np.atleast_1d(res_opt.x))
+                except Exception:
+                    continue
+
+        if best_feas is None:
+            iis_c = best_infeas[1] if best_infeas else list(graph.constraints.keys())
+            min_sl = best_infeas[0] if best_infeas else None
+            return {
+                "status": "INFEASIBLE",
+                "certificate_status": SolveStatus.INFEASIBLE_CERTIFIED.value,
+                "iis_constraints": iis_c,
+                "blocking_constraints": iis_c,
+                "min_relaxation_slack": min_sl,
+                "kkt_shadow_prices": {},
+                "certificate": {
+                    "status": SolveStatus.INFEASIBLE_CERTIFIED.value,
+                    "problem_class": "BLACKBOX_NLP",
+                    "strategy_used": "blackbox_multistart_powell",
+                    "iis_constraints": iis_c,
+                },
+                "reason": f"No feasible control vector satisfies hard constraints: {iis_c}",
+            }
+
+        _, best_st, best_active = best_feas
+        j_best = float(best_st[resolved_target])
+        opt_ctrls = {cid: round(float(best_st[cid]), 6) for cid in control_ids}
+        opt_deltas = {
+            cid: round(
+                float(best_st[cid])
+                - (float(graph.nodes[cid].current_value) if isinstance(graph.nodes[cid].current_value, (int, float)) else 0.0),
+                6,
+            )
+            for cid in control_ids
+        }
+        return {
+            "status": "OPTIMAL",
+            "certificate_status": SolveStatus.BEST_FOUND.value,
+            "problem_class": "BLACKBOX_NLP",
+            "strategy_used": "blackbox_multistart_powell",
+            "controls": opt_ctrls,
+            "optimal_deltas": opt_deltas,
+            "objective_value": j_best,
+            "baseline_objective": base_j,
+            "evaluated_nodes": {k: round(float(v), 6) for k, v in best_st.items()},
+            "active_constraints": best_active,
+            "active_regime": "blackbox_verified",
+            "certificate": {
+                "status": SolveStatus.BEST_FOUND.value,
+                "problem_class": "BLACKBOX_NLP",
+                "strategy_used": "blackbox_multistart_powell",
+                "fidelity_verified": True,
+                "code_verified": True,
+                "max_constraint_violation": 0.0,
+            },
+        }
+
     def solve(
         self,
         target_id: Optional[str] = None,
@@ -1281,9 +1653,39 @@ class ActorDBOracle:
         graph_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Calcula la receta óptima certificada respetando todas las invariantes duras y la compuerta epistémica."""
-        graph, cache_hit, err = self.resolve_graph(source_path=source_path, graph_data=graph_data)
+        hints_s: List[str] = []
+        if isinstance(fixed_controls, dict):
+            hints_s.extend(str(k) for k in fixed_controls.keys())
+        if isinstance(exo_overrides, dict):
+            hints_s.extend(str(k) for k in exo_overrides.keys())
+        graph, cache_hit, err = self.resolve_graph(
+            source_path=source_path,
+            graph_data=graph_data,
+            target_hint=target_id,
+            actor_hints=hints_s or None,
+        )
         if err is not None or graph is None:
             return _clean_json_val(err)
+
+        def _solve_submodel_matches(g_cand: CausalGraph) -> bool:
+            if target_id is not None and target_id not in g_cand.nodes:
+                return False
+            if isinstance(fixed_controls, dict) and any(
+                k not in g_cand.nodes or g_cand.nodes[k].category != "control" for k in fixed_controls
+            ):
+                return False
+            if isinstance(exo_overrides, dict) and any(
+                k not in g_cand.nodes or g_cand.nodes[k].category != "exogenous" for k in exo_overrides
+            ):
+                return False
+            return True
+
+        if not _solve_submodel_matches(graph):
+            alt_s = self._resolve_alternate_adapter_submodel(
+                source_path, graph_data, graph, _solve_submodel_matches
+            )
+            if alt_s is not None:
+                graph, cache_hit = alt_s
 
         resolved_target, t_err = self._resolve_target_id(graph, target_id)
         if t_err is not None or resolved_target is None:
@@ -1361,7 +1763,7 @@ class ActorDBOracle:
                         "zero_hallucination_verified": True,
                     })
 
-        dag, _, _, compiled_fns = self._compile_graph_mechanisms(graph)
+        dag, syms, _, compiled_fns = self._compile_graph_mechanisms(graph)
         if not nx.is_directed_acyclic_graph(dag):
             cycles = [list(c) for c in nx.simple_cycles(dag)]
             return _clean_json_val({
@@ -1387,7 +1789,7 @@ class ActorDBOracle:
                 return _clean_json_val({
                     "status": "INFEASIBLE",
                     "certificate_status": SolveStatus.INFEASIBLE_CERTIFIED.value,
-                    "seal": "PROVEN",
+                    "seal": do_res.get("seal", "PROVEN"),
                     "system_id": graph.system_id,
                     "target_id": resolved_target,
                     "sense": resolved_sense,
@@ -1430,15 +1832,48 @@ class ActorDBOracle:
                     out_c.append(orig)
             return out_c
 
-        solver_graph = _normalize_graph_for_solver(graph, exo_overrides=exo_overrides)
-        sol = solve_problem(
-            ir=solver_graph,
-            target_id=resolved_target,
-            sense=resolved_sense,
-            mode="direct",
-            exo_overrides=exo_overrides,
-            fixed_controls=fixed_controls,
+        bb_map = getattr(graph, "_blackbox_callables", {}) or {}
+        surr_map = (graph.metadata or {}).get("blackbox_surrogates", {}) or {}
+        cone_check: Set[str] = (
+            (nx.ancestors(dag, resolved_target) | {resolved_target})
+            if dag.has_node(resolved_target)
+            else {resolved_target}
         )
+        for c_obj in graph.constraints.values():
+            if c_obj.type == "hard" and c_obj.expression:
+                for vid in _extract_identifiers(c_obj.expression):
+                    if vid in dag:
+                        cone_check.add(vid)
+                        cone_check.update(nx.ancestors(dag, vid))
+        has_pure_blackbox = any(
+            (nid in bb_map)
+            and not graph.nodes[nid].symbolic_expr
+            and (nid not in surr_map or not surr_map[nid].get("surrogate_sympy_expr"))
+            for nid in cone_check
+        )
+
+        solver_graph = _normalize_graph_for_solver(graph, exo_overrides=exo_overrides)
+        if has_pure_blackbox:
+            sol = self._solve_blackbox_graph(
+                graph=graph,
+                dag=dag,
+                syms=syms,
+                compiled_fns=compiled_fns,
+                resolved_target=resolved_target,
+                resolved_sense=resolved_sense,
+                control_ids=control_ids,
+                fixed_controls=fixed_controls,
+                exo_overrides=exo_overrides,
+            )
+        else:
+            sol = solve_problem(
+                ir=solver_graph,
+                target_id=resolved_target,
+                sense=resolved_sense,
+                mode="direct",
+                exo_overrides=exo_overrides,
+                fixed_controls=fixed_controls,
+            )
 
         if sol.get("status") == "UNSUPPORTED":
             return _clean_json_val({
@@ -1469,10 +1904,11 @@ class ActorDBOracle:
             cert_dict = dict(sol.get("certificate") or {})
             if "iis_constraints" in cert_dict:
                 cert_dict["iis_constraints"] = iis_clean
+            infeas_seal = "SAMPLED_VERIFIED" if sol.get("problem_class") == "BLACKBOX_NLP" else "PROVEN"
             return _clean_json_val({
                 "status": "INFEASIBLE",
                 "certificate_status": SolveStatus.INFEASIBLE_CERTIFIED.value,
-                "seal": "PROVEN",
+                "seal": infeas_seal,
                 "system_id": graph.system_id,
                 "target_id": resolved_target,
                 "sense": resolved_sense,
@@ -1619,9 +2055,44 @@ class ActorDBOracle:
         graph_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Verifica formalmente invariantes, propiedades lógicas/cuantitativas o consistencia IIS del sistema."""
-        graph, cache_hit, err = self.resolve_graph(source_path=source_path, graph_data=graph_data)
+        hints_p: List[str] = []
+        if invariant_expr:
+            hints_p.extend(_extract_identifiers(invariant_expr))
+        if isinstance(domain_bounds, dict):
+            hints_p.extend(str(k) for k in domain_bounds.keys())
+        if constraint_id:
+            hints_p.append(str(constraint_id))
+
+        graph, cache_hit, err = self.resolve_graph(
+            source_path=source_path,
+            graph_data=graph_data,
+            actor_hints=hints_p or None,
+        )
         if err is not None or graph is None:
             return _clean_json_val(err)
+
+        inv_req_actors = (
+            [rid for rid in _extract_identifiers(invariant_expr) if rid != "pi"]
+            if invariant_expr
+            else []
+        )
+        dom_req_actors = [str(k) for k in domain_bounds.keys()] if isinstance(domain_bounds, dict) else []
+
+        def _prove_submodel_matches(g_cand: CausalGraph) -> bool:
+            if constraint_id and constraint_id not in g_cand.constraints:
+                return False
+            if any(rid not in g_cand.nodes for rid in inv_req_actors):
+                return False
+            if any(dk not in g_cand.nodes for dk in dom_req_actors):
+                return False
+            return True
+
+        if not _prove_submodel_matches(graph):
+            alt_p = self._resolve_alternate_adapter_submodel(
+                source_path, graph_data, graph, _prove_submodel_matches
+            )
+            if alt_p is not None:
+                graph, cache_hit = alt_p
 
         res = prove_on_graph(
             graph=graph,

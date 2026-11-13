@@ -24,6 +24,7 @@ Verifica:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -41,6 +42,7 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.memory import create_connected_server_and_client_session
 import pytest
+from sse_starlette.sse import AppStatus
 import sympy as sp
 import uvicorn
 
@@ -111,7 +113,33 @@ def _extract_mcp_json(call_result: Any) -> Dict[str, Any]:
 # ==============================================================================
 
 
+async def _shutdown_uvicorn_server(
+    uv_srv: uvicorn.Server,
+    serve_task: asyncio.Task[Any],
+    sock: socket.socket,
+) -> None:
+    """Cierra `uvicorn.Server` con timeout estricto y resetea el singleton global `AppStatus.should_exit`."""
+    uv_srv.should_exit = True
+    AppStatus.should_exit = True
+    try:
+        await asyncio.wait_for(serve_task, timeout=5.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        uv_srv.force_exit = True
+        serve_task.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(serve_task, timeout=2.0)
+    finally:
+        sock.close()
+        AppStatus.should_exit = False
+
+
 class TestMCPProtocolAndTransport:
+    @pytest.fixture(autouse=True)
+    def _reset_sse_app_status(self):
+        AppStatus.should_exit = False
+        yield
+        AppStatus.should_exit = False
+
     def test_in_memory_mcp_tool_discovery_and_invocation(self):
         server = create_mcp_server(name="test-actordb", default_source=GOLDEN_CASE_DIR)
 
@@ -175,28 +203,29 @@ class TestMCPProtocolAndTransport:
         )
 
         async def _stdio_scenario() -> None:
-            async with stdio_client(params) as (read_stream, write_stream):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    tools = await session.list_tools()
-                    assert {t.name for t in tools.tools} == {"cge_trace", "cge_do", "cge_solve", "cge_prove"}
+            with anyio.fail_after(30.0):
+                async with stdio_client(params) as (read_stream, write_stream):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        tools = await session.list_tools()
+                        assert {t.name for t in tools.tools} == {"cge_trace", "cge_do", "cge_solve", "cge_prove"}
 
-                    res_trace = _extract_mcp_json(await session.call_tool("cge_trace", {}))
-                    assert res_trace["status"] == "OK"
-                    assert res_trace["target_id"] == "run_noisy"
+                        res_trace = _extract_mcp_json(await session.call_tool("cge_trace", {}))
+                        assert res_trace["status"] == "OK"
+                        assert res_trace["target_id"] == "run_noisy"
 
-                    res_prove = _extract_mcp_json(
-                        await session.call_tool("cge_prove", {"invariant_expr": "run_noisy <= 2500.0 - 100.0 * cost"})
-                    )
-                    assert res_prove["status"] == "PROVEN"
-                    assert res_prove["seal"] == "PROVEN"
+                        res_prove = _extract_mcp_json(
+                            await session.call_tool("cge_prove", {"invariant_expr": "run_noisy <= 2500.0 - 100.0 * cost"})
+                        )
+                        assert res_prove["status"] == "PROVEN"
+                        assert res_prove["seal"] == "PROVEN"
 
-                    # Consultar también `golden_case` (que usa `logging.info` + CSV + multi-módulo) sobre el mismo canal stdio
-                    res_gc = _extract_mcp_json(
-                        await session.call_tool("cge_solve", {"target_id": "profit", "source_path": GOLDEN_CASE_DIR})
-                    )
-                    assert res_gc["status"] == "OPTIMAL"
-                    assert res_gc["controls"]["order_qty"] >= 800
+                        # Consultar también `golden_case` (que usa `logging.info` + CSV + multi-módulo) sobre el mismo canal stdio
+                        res_gc = _extract_mcp_json(
+                            await session.call_tool("cge_solve", {"target_id": "profit", "source_path": GOLDEN_CASE_DIR})
+                        )
+                        assert res_gc["status"] == "OPTIMAL"
+                        assert res_gc["controls"]["order_qty"] >= 800
 
         anyio.run(_stdio_scenario)
 
@@ -287,11 +316,9 @@ class TestMCPProtocolAndTransport:
                         assert r_prove["status"] == "PROVEN"
                         assert r_prove["seal"] == "PROVEN"
             finally:
-                uv_srv.should_exit = True
-                await serve_task
-                sock.close()
+                await _shutdown_uvicorn_server(uv_srv, serve_task, sock)
 
-        asyncio.run(_http_scenario())
+        asyncio.run(asyncio.wait_for(_http_scenario(), timeout=30.0))
 
     def test_concurrent_streamable_http_and_stdout_thread_safety(self):
         """Verifica sesiones concurrentes (`asyncio.gather`) sobre `streamable-http` sin bloqueo del event loop
@@ -362,11 +389,9 @@ class TestMCPProtocolAndTransport:
                 assert r_sol["status"] == "OPTIMAL"
                 assert r_pr["status"] == "PROVEN"
             finally:
-                uv_http.should_exit = True
-                await task_http
-                sock_http.close()
+                await _shutdown_uvicorn_server(uv_http, task_http, sock_http)
 
-        asyncio.run(_concurrent_http_scenario())
+        asyncio.run(asyncio.wait_for(_concurrent_http_scenario(), timeout=30.0))
 
     def test_real_sse_loopback_transport(self):
         """Verifica el transporte de red MCP `sse` (`Server-Sent Events`) sobre un socket TCP loopback real."""
@@ -419,11 +444,9 @@ class TestMCPProtocolAndTransport:
                         )
                         assert res_sse["status"] == "PROVEN"
             finally:
-                uv_sse.should_exit = True
-                await task_sse
-                sock_sse.close()
+                await _shutdown_uvicorn_server(uv_sse, task_sse, sock_sse)
 
-        asyncio.run(_sse_scenario())
+        asyncio.run(asyncio.wait_for(_sse_scenario(), timeout=30.0))
 
 
 # ==============================================================================

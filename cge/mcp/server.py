@@ -94,7 +94,10 @@ SERVER_INSTRUCTIONS = (
     "Use `cge_trace` to inspect causal lineage, total derivatives, and dead nodes (T1); "
     "`cge_do` to execute Pearlian counterfactual interventions do(X=x) with graph surgery; "
     "`cge_solve` to compute certified optimal policies under hard constraints (or Minimal IIS if infeasible); "
-    "and `cge_prove` to formally verify invariants (`PROVEN`, `SAMPLED_VERIFIED`, or `FALSIFIED` with exact counterexample)."
+    "and `cge_prove` to formally verify invariants (`PROVEN`, `SAMPLED_VERIFIED`, or `FALSIFIED` with exact counterexample). "
+    "`source_path` accepts adapter repo IDs (e.g. `supplychainpy_mini`, `economic_dispatch`, `loan_tax_engine`, "
+    "`quantecon_cournot_solow`, `epidemiology_seir`), explicit `:submodel` selectors (e.g. `quantecon_cournot_solow:cournot`), "
+    "repository directories, `.py` modules, JSON IR files, or inline Python source."
 )
 
 

@@ -13,12 +13,9 @@ Validates:
 """
 
 from __future__ import annotations
-import json
-import os
 import subprocess
 import re
-from pathlib import Path
-from typing import Dict, Any, List, Set
+from typing import Dict, Any
 import pytest
 
 pytestmark = [pytest.mark.integrity, pytest.mark.e2e]
@@ -79,7 +76,7 @@ class TestCgeDirectoryIntegrity:
 
     def test_cge_directory_git_cleanliness(self, repo_root, cge_dir):
         """Verifies that cge/ remains completely untouched during the study.
-        
+
         cge/ is strictly read-only for the baseline study.
         """
         assert cge_dir.exists(), f"cge/ directory does not exist at {cge_dir}"
@@ -110,11 +107,14 @@ class TestCgeDirectoryIntegrity:
         }
 
         if raw_output:
-            lines = [l.strip() for l in raw_output.splitlines() if l.strip()]
+            lines = [line_str.strip() for line_str in raw_output.splitlines() if line_str.strip()]
             new_or_untracked = [
-                l for l in lines
-                if l not in known_preexisting and l not in sanctioned_packages
-                and not any(l.startswith(f"?? cge/{pkg}/") for pkg in ("diff", "ingest_adapters", "mcp"))
+                line_str for line_str in lines
+                if line_str not in known_preexisting and line_str not in sanctioned_packages
+                and not any(
+                    line_str.split()[-1].replace("\\", "/").startswith(f"cge/{pkg}/")
+                    for pkg in ("diff", "ingest_adapters", "mcp")
+                )
             ]
             assert not new_or_untracked, (
                 f"Integrity violation: unexpected new modifications or untracked files in cge/:\n"

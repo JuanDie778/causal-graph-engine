@@ -510,6 +510,9 @@ def _parse_single_relational(
     return out
 
 
+_COMPILED_CONSTR_EVAL_CACHE: Dict[Tuple[str, bool], Tuple[Optional[bool], List[Tuple[List[Any], List[Any]]]]] = {}
+
+
 def evaluate_constraint_at_state(
     expr_str: str,
     state: Dict[str, float],
@@ -517,39 +520,75 @@ def evaluate_constraint_at_state(
     tol: float = 1e-5,
 ) -> Tuple[bool, float]:
     """Evalúa de forma exacta cualquier restricción relacional o lógica (`=>`, `and`, `or`, `not`) sobre `state`."""
-    ids = _extract_identifiers(expr_str)
-    syms_map: Dict[str, Any] = dict(local_syms) if local_syms is not None else {
-        k: (sp.pi if k == "pi" else sp.Symbol(k, real=True)) for k in ids
-    }
-    for k in ids:
-        if k not in syms_map:
-            syms_map[k] = sp.pi if k == "pi" else sp.Symbol(k, real=True)
-    for fn_name, fn_sym in _MATH_FUNC_LOCALS.items():
-        syms_map.setdefault(fn_name, fn_sym)
+    pi_is_sym = bool(local_syms is not None and "pi" in local_syms and isinstance(local_syms["pi"], sp.Symbol))
+    cache_key = (expr_str.strip(), pi_is_sym)
+    cached_entry = _COMPILED_CONSTR_EVAL_CACHE.get(cache_key)
 
-    clauses, const_truth = _parse_propositional_cnf(expr_str, syms_map)
+    if cached_entry is None:
+        ids = _extract_identifiers(expr_str)
+        syms_map: Dict[str, Any] = {
+            k: (sp.Symbol("pi", real=True) if (k == "pi" and pi_is_sym) else (sp.pi if k == "pi" else sp.Symbol(k, real=True)))
+            for k in ids
+        }
+        for fn_name, fn_sym in _MATH_FUNC_LOCALS.items():
+            syms_map.setdefault(fn_name, fn_sym)
+
+        clauses, const_truth = _parse_propositional_cnf(expr_str, syms_map)
+        compiled_clauses: List[Tuple[List[Any], List[Any]]] = []
+        if const_truth is None:
+            for cl in clauses:
+                c_ants: List[Any] = []
+                for ant in cl.antecedents:
+                    a_names = sorted(str(s) for s in ant.expr.free_symbols)
+                    a_syms = [syms_map.setdefault(n, sp.Symbol(n, real=True)) for n in a_names]
+                    a_fn = sp.lambdify(a_syms, ant.expr, modules=_SAFE_NUMERIC_MODS)
+                    c_ants.append((ant.strict, a_names, a_fn, ant.expr, syms_map))
+                c_cqs: List[Any] = []
+                for cq in cl.consequents:
+                    q_names = sorted(str(s) for s in cq.expr.free_symbols)
+                    q_syms = [syms_map.setdefault(n, sp.Symbol(n, real=True)) for n in q_names]
+                    q_fn = sp.lambdify(q_syms, cq.expr, modules=_SAFE_NUMERIC_MODS)
+                    c_cqs.append((cq.strict, q_names, q_fn, cq.expr, syms_map))
+                compiled_clauses.append((c_ants, c_cqs))
+
+        if len(_COMPILED_CONSTR_EVAL_CACHE) >= 1024:
+            _COMPILED_CONSTR_EVAL_CACHE.pop(next(iter(_COMPILED_CONSTR_EVAL_CACHE)), None)
+        cached_entry = (const_truth, compiled_clauses)
+        _COMPILED_CONSTR_EVAL_CACHE[cache_key] = cached_entry
+
+    const_truth, compiled_clauses = cached_entry
     if const_truth is True:
         return True, 1.0
     if const_truth is False:
         return False, -1.0
 
-    subs_state = {syms_map[k]: float(v) for k, v in state.items() if k in syms_map and isinstance(syms_map[k], sp.Symbol)}
-
-    def _eval_atom(iq: _AtomicInequality) -> Tuple[bool, float]:
-        v = float(iq.expr.evalf(subs=subs_state, chop=True))
+    def _eval_compiled_atom(atom_spec: Tuple[Any, ...]) -> Tuple[bool, float]:
+        strict_flag, arg_names, fn_num, raw_e, s_map = atom_spec
+        try:
+            v = float(fn_num(*[float(state[a]) for a in arg_names]))
+        except Exception:
+            try:
+                subs_st = {
+                    s_map[k]: float(val)
+                    for k, val in state.items()
+                    if k in s_map and isinstance(s_map[k], sp.Symbol)
+                }
+                v = float(raw_e.evalf(subs=subs_st, chop=True))
+            except Exception:
+                return False, -math.inf
         if not math.isfinite(v):
             return False, -math.inf
-        sat = (v < -1e-9) if iq.strict else (v <= tol)
+        sat = (v < -1e-9) if strict_flag else (v <= tol)
         return sat, -v
 
     overall_sat = True
     worst_margin = math.inf
 
-    for cl in clauses:
+    for c_ants, c_cqs in compiled_clauses:
         ant_all_hold = True
         best_ant_escape_margin = -math.inf
-        for ant in cl.antecedents:
-            a_sat, a_margin = _eval_atom(ant)
+        for ant_sp in c_ants:
+            a_sat, a_margin = _eval_compiled_atom(ant_sp)
             if not a_sat:
                 ant_all_hold = False
                 best_ant_escape_margin = max(best_ant_escape_margin, -a_margin)
@@ -559,8 +598,8 @@ def evaluate_constraint_at_state(
 
         clause_sat = False
         best_conseq_margin = -math.inf
-        for cq in cl.consequents:
-            c_sat, c_margin = _eval_atom(cq)
+        for cq_sp in c_cqs:
+            c_sat, c_margin = _eval_compiled_atom(cq_sp)
             if c_sat:
                 clause_sat = True
             best_conseq_margin = max(best_conseq_margin, c_margin)
@@ -1401,6 +1440,15 @@ def _eval_expr_interval(expr: sp.Expr, box: Dict[str, Interval]) -> Interval:
             fv = float(exp_arg.evalf())
             is_int = (e_iv[0] == e_iv[1]) and fv.is_integer()
             return _iv_pow(b_iv, fv, is_int, exp_iv=e_iv)
+        e_iv = _eval_expr_interval(exp_arg, box)
+        if (
+            0.0 < b_iv[0] <= b_iv[1]
+            and math.isfinite(b_iv[1])
+            and math.isfinite(e_iv[0])
+            and math.isfinite(e_iv[1])
+            and e_iv[0] <= e_iv[1]
+        ):
+            return _iv_exp(_iv_mul(e_iv, _iv_log(b_iv)))
         return (-math.inf, math.inf)
     if isinstance(expr, sp.exp):
         return _iv_exp(_eval_expr_interval(expr.args[0], box))
@@ -1463,6 +1511,65 @@ def _extract_piecewise_thresholds(expr: sp.Expr) -> Dict[str, List[float]]:
     return {k: sorted(vals) for k, vals in thresholds.items()}
 
 
+def _extract_box_aware_thresholds(
+    expr: sp.Expr,
+    base_box: Dict[str, Interval],
+    int_domains: Set[str],
+    treat_expr_as_zero_guard: bool = False,
+) -> Dict[str, List[float]]:
+    """Extrae umbrales escalares y raíces afines/bilineales de guardas de rama sobre `base_box`."""
+    thresholds: Dict[str, Set[float]] = {
+        k: set(vals) for k, vals in _extract_piecewise_thresholds(expr).items()
+    }
+    guard_exprs: List[sp.Expr] = []
+    if treat_expr_as_zero_guard and not expr.has(sp.Piecewise, sp.Min, sp.Max, sp.Abs):
+        guard_exprs.append(expr)
+    for sub in sp.preorder_traversal(expr):
+        if isinstance(sub, (sp.LessThan, sp.StrictLessThan, sp.GreaterThan, sp.StrictGreaterThan)):
+            diff_rel = sub.lhs - sub.rhs
+            if not diff_rel.has(sp.Piecewise, sp.Min, sp.Max, sp.Abs):
+                guard_exprs.append(diff_rel)
+
+    for g_e in guard_exprs:
+        for v_sym in list(g_e.free_symbols):
+            vn = str(v_sym)
+            if vn not in base_box or vn in int_domains:
+                continue
+            lo_v, hi_v = base_box[vn]
+            if hi_v <= lo_v + 1e-15:
+                continue
+            try:
+                b_part, dep_part = g_e.as_independent(v_sym, as_Add=True)
+                if dep_part == 0:
+                    continue
+                a_part = sp.simplify(dep_part / v_sym)
+                if v_sym in a_part.free_symbols:
+                    continue
+                other_syms = sorted((b_part.free_symbols | a_part.free_symbols) - {v_sym}, key=str)
+                if len(other_syms) > 3 or any(str(os) not in base_box for os in other_syms):
+                    continue
+                root_expr = -b_part / a_part
+                for corner in itertools.product([0, 1], repeat=len(other_syms)):
+                    subs_c = {
+                        other_syms[idx_o]: sp.Float(base_box[str(other_syms[idx_o])][corner[idx_o]])
+                        for idx_o in range(len(other_syms))
+                    }
+                    rt_val = float(root_expr.evalf(subs=subs_c))
+                    if math.isfinite(rt_val):
+                        if other_syms and rt_val != 0.0:
+                            pad = max(1e-16, abs(rt_val) * 1e-9)
+                            cands: Tuple[float, ...] = (rt_val - pad, rt_val, rt_val + pad)
+                        else:
+                            cands = (rt_val,)
+                        for cand_rt in cands:
+                            if lo_v < cand_rt < hi_v:
+                                thresholds.setdefault(vn, set()).add(cand_rt)
+            except Exception:
+                continue
+
+    return {k: sorted(vals) for k, vals in thresholds.items()}
+
+
 def _prove_by_interval_bnb(
     viol_expr: sp.Expr,
     strict: bool,
@@ -1475,10 +1582,32 @@ def _prove_by_interval_bnb(
 
     Retorna (proven, worst_upper_bound). Si todas las subcajas se podan por infactibilidad, worst_upper_bound == -inf.
     """
-    var_names = [k for k, (lo, hi) in base_box.items() if hi > lo + 1e-12]
-    thresholds = _extract_piecewise_thresholds(viol_expr)
+    if viol_expr.has(sp.Piecewise):
+        try:
+            folded_v = sp.piecewise_fold(viol_expr)
+            if isinstance(folded_v, sp.Piecewise) and len(folded_v.args) <= 12:
+                new_pw_args = []
+                for v_br, c_br in folded_v.args:
+                    orig_sym_occ = sum(1 for t in sp.preorder_traversal(v_br) if t.is_Symbol)
+                    simp_br = sp.simplify(v_br)
+                    simp_sym_occ = sum(1 for t in sp.preorder_traversal(simp_br) if t.is_Symbol)
+                    use_br = simp_br if (simp_br.is_Number or simp_sym_occ < orig_sym_occ) else v_br
+                    new_pw_args.append((use_br, c_br))
+                viol_expr = sp.Piecewise(*new_pw_args)
+        except Exception:
+            pass
+
+    expr_var_set: Set[str] = {str(s) for s in viol_expr.free_symbols}
     for c_e, _ in sys_constr_exprs:
-        for vn, vals in _extract_piecewise_thresholds(c_e).items():
+        expr_var_set.update(str(s) for s in c_e.free_symbols)
+
+    all_nondeg_vars = [k for k, (lo, hi) in base_box.items() if hi > lo + 1e-15]
+    active_vars = [k for k in all_nondeg_vars if k in expr_var_set]
+    var_names = active_vars if active_vars else all_nondeg_vars
+
+    thresholds = _extract_box_aware_thresholds(viol_expr, base_box, int_domains, treat_expr_as_zero_guard=False)
+    for c_e, _ in sys_constr_exprs:
+        for vn, vals in _extract_box_aware_thresholds(c_e, base_box, int_domains, treat_expr_as_zero_guard=True).items():
             thresholds.setdefault(vn, [])
             thresholds[vn] = sorted(set(thresholds[vn]) | set(vals))
 
@@ -1515,10 +1644,12 @@ def _prove_by_interval_bnb(
         split_var: Optional[str] = None
         split_point: Optional[float] = None
         for vn, th_list in thresholds.items():
-            if vn in box:
+            if vn in box and vn in var_names:
                 lo, hi = box[vn]
+                lo_tol = max(1e-18, 1e-12 * abs(lo))
+                hi_tol = max(1e-18, 1e-12 * abs(hi))
                 for th in th_list:
-                    if lo + 1e-11 < th < hi - 1e-11:
+                    if lo + lo_tol < th < hi - hi_tol:
                         split_var = vn
                         split_point = th
                         break
@@ -1532,7 +1663,8 @@ def _prove_by_interval_bnb(
                 span = (hi - lo) / max(1.0, abs(lo), abs(hi))
                 if vn in int_domains and hi - lo < 1.0 - 1e-9:
                     continue
-                if span > best_span and hi - lo > 1e-11:
+                min_w = max(1e-16, 1e-11 * max(abs(lo), abs(hi)))
+                if span > best_span and hi - lo > min_w:
                     best_span = span
                     split_var = vn
             if split_var is None:
@@ -2364,7 +2496,12 @@ def _check_joint_domain_consistency(
                     return 1e6
 
             try:
-                opt_f = minimize(_feas_loss, x0, method="L-BFGS-B", bounds=b_bnds, options={"maxiter": 60})
+                feas_opts = (
+                    {"maxiter": 25, "maxfun": 80}
+                    if getattr(graph, "_blackbox_callables", None)
+                    else {"maxiter": 60}
+                )
+                opt_f = minimize(_feas_loss, x0, method="L-BFGS-B", bounds=b_bnds, options=feas_opts)
                 if opt_f.x is not None:
                     cand_f = dict(base0)
                     for idx_c, cv_id in enumerate(cont_vars):
@@ -2733,7 +2870,20 @@ def _prove_single_expression(
         lid for lid in leaf_ids
         if graph.nodes[lid].category == "exogenous" and bounds_map[lid][1] > bounds_map[lid][0] + 1e-12
     ]
-    if assume_system_constraints and exclude_constraint_id is None and varying_exo_ids and control_sym_set:
+    surr_meta = (graph.metadata or {}).get("blackbox_surrogates", {}) or {}
+    solver_supports_graph = not any(
+        (nid in has_callable)
+        and not graph.nodes[nid].symbolic_expr
+        and (nid not in surr_meta or not surr_meta[nid].get("surrogate_sympy_expr"))
+        for nid in required_eval_nodes
+    )
+    if (
+        solver_supports_graph
+        and assume_system_constraints
+        and exclude_constraint_id is None
+        and varying_exo_ids
+        and control_sym_set
+    ):
         inv_leaf_syms: Set[sp.Basic] = set()
         for cl in cnf_clauses:
             for a_iq in cl.antecedents:
@@ -2789,14 +2939,16 @@ def _prove_single_expression(
                         merged.update(u_map)
                         merged.update(xp)
                         try:
-                            v_x = float(fn_fq(*[merged[s] for s in fq_syms]))
+                            src_m = merged if all(s in merged for s in fq_syms) else _eval_full_state(merged)
+                            v_x = float(fn_fq(*[src_m[s] for s in fq_syms]))
                             best_x_v = min(best_x_v, v_x)
                         except Exception:
                             pass
                     return -best_x_v if math.isfinite(best_x_v) else 0.0
 
                 try:
-                    opt_u = minimize(_neg_min_over_x, u0_arr, method="L-BFGS-B", bounds=u_bnds, options={"maxiter": 30})
+                    u_opts = {"maxiter": 15, "maxfun": 50} if has_callable else {"maxiter": 30}
+                    opt_u = minimize(_neg_min_over_x, u0_arr, method="L-BFGS-B", bounds=u_bnds, options=u_opts)
                     if opt_u.x is not None:
                         u_adv = dict(exo_mid)
                         for idx_u, uid in enumerate(cont_exo):
@@ -2814,7 +2966,8 @@ def _prove_single_expression(
                     merged.update(u_cand)
                     merged.update(xp)
                     try:
-                        min_v = min(min_v, float(fn_fq(*[merged[s] for s in fq_syms])))
+                        src_m2 = merged if all(s in merged for s in fq_syms) else _eval_full_state(merged)
+                        min_v = min(min_v, float(fn_fq(*[src_m2[s] for s in fq_syms])))
                     except Exception:
                         pass
                 if math.isfinite(min_v) and min_v > 1e-6:
@@ -2999,7 +3152,15 @@ def _prove_single_expression(
                         encountered_singularity_pole = str(g_expr)
                         encountered_singularity_kind = g_kind
 
-        clause_can_prove = can_claim_proven and not clause_has_reachable_singularity
+        clause_rel_nodes: Set[str] = set()
+        for iq_c in list(cl.antecedents) + list(cl.consequents):
+            for s_c in iq_c.expr.free_symbols:
+                sn_c = str(s_c)
+                if sn_c in graph.nodes:
+                    clause_rel_nodes.add(sn_c)
+                    if sn_c in dag:
+                        clause_rel_nodes.update(nx.ancestors(dag, sn_c))
+        clause_can_prove = (len(clause_rel_nodes & unverified_or_opaque) == 0) and not clause_has_reachable_singularity
 
         def _check_clause_witness(
             cand_leaf: Dict[str, float],
@@ -3260,10 +3421,33 @@ def _prove_single_expression(
                     if iv_ub is not None and math.isfinite(iv_ub):
                         worst_violation_observed = max(worst_violation_observed, iv_ub)
 
-        # Etapa 4: Búsqueda Adversaria de Contraejemplos (Sobol + Esquinas + Sondas de Umbral + L-BFGS-B)
+        # Etapa 4: Búsqueda Adversaria de Contraejemplos (Sobol + Esquinas + Sondas de Umbral + L-BFGS-B / Powell)
         if not clause_proven:
             f_syms_eff = sorted(str(s) for s in eff_viol_expr.free_symbols)
             fn_eff_leaf = sp.lambdify([syms[s] for s in f_syms_eff], eff_viol_expr, modules=safe_mods)
+
+            clause_eval_nodes: Set[str] = set(clause_rel_nodes) | set(leaf_ids)
+            for c_s_act in active_hard_cids_exprs.values():
+                for h_id_c in _extract_identifiers(c_s_act):
+                    if h_id_c in graph.nodes:
+                        clause_eval_nodes.add(h_id_c)
+                        if h_id_c in dag:
+                            clause_eval_nodes.update(nx.ancestors(dag, h_id_c))
+            clause_uses_blackbox = bool(clause_eval_nodes & set(has_callable.keys()))
+
+            def _eval_clause_state(
+                leaf_vals_c: Dict[str, float],
+                _need_nodes: Set[str] = clause_eval_nodes,
+            ) -> Dict[str, float]:
+                st_c: Dict[str, float] = {}
+                for lid_c in leaf_ids:
+                    v_c = leaf_vals_c.get(lid_c, graph.nodes[lid_c].current_value or 0.0)
+                    st_c[lid_c] = float(int(round(v_c))) if lid_c in int_domains else float(v_c)
+                for nid_c in topo_all:
+                    if nid_c in _need_nodes and nid_c in node_fns:
+                        arg_names_c, fn_c = node_fns[nid_c]
+                        st_c[nid_c] = float(fn_c(*[st_c[a_c] for a_c in arg_names_c]))
+                return st_c
 
             local_checked = 0
             best_sample_pt = nom_pt
@@ -3292,7 +3476,7 @@ def _prove_single_expression(
                 if w is not None:
                     return _build_falsified_response(invariant_expr, constraint_id_label, w, "adversarial_sobol_search")
                 try:
-                    vv = float(fn_eff_leaf(*[pt[s] for s in f_syms_eff]))
+                    vv = float(fn_eff_leaf(*[full_st_pt[s] for s in f_syms_eff]))
                     if vv > best_sample_val:
                         best_sample_val = vv
                         best_sample_pt = pt
@@ -3301,9 +3485,10 @@ def _prove_single_expression(
                     pass
             feasible_samples_checked = max(feasible_samples_checked, local_checked)
 
-            if cont_vars:
-                x0_vec = np.array([best_sample_pt[v] for v in cont_vars], dtype=float)
-                b_bounds = [(bounds_map[v][0], bounds_map[v][1]) for v in cont_vars]
+            clause_cont_vars = [v for v in cont_vars if v in clause_eval_nodes] or list(cont_vars)
+            if clause_cont_vars:
+                x0_vec = np.array([best_sample_pt[v] for v in clause_cont_vars], dtype=float)
+                b_bounds = [(bounds_map[v][0], bounds_map[v][1]) for v in clause_cont_vars]
 
                 def _neg_viol(
                     x_arr: np.ndarray,
@@ -3311,13 +3496,15 @@ def _prove_single_expression(
                     _fn_eff_leaf: Callable[..., Any] = fn_eff_leaf,
                     _f_syms_eff: List[str] = f_syms_eff,
                     _ant_evals: List[Any] = ant_evals,
+                    _c_vars: List[str] = clause_cont_vars,
+                    _eval_st_c: Callable[[Dict[str, float]], Dict[str, float]] = _eval_clause_state,
                 ) -> float:
                     cand = dict(_best_sample_pt)
-                    for idx_c, cv_id in enumerate(cont_vars):
+                    for idx_c, cv_id in enumerate(_c_vars):
                         cand[cv_id] = float(x_arr[idx_c])
                     try:
-                        full_c = _eval_full_state(cand)
-                        val = float(_fn_eff_leaf(*[cand[s] for s in _f_syms_eff]))
+                        full_c = _eval_st_c(cand)
+                        val = float(_fn_eff_leaf(*[full_c[s] for s in _f_syms_eff]))
                         pen = 0.0
                         for _, c_s in active_hard_cids_exprs.items():
                             ok_c, marg_c = evaluate_constraint_at_state(c_s, full_c, local_syms=local_syms, tol=0.0)
@@ -3333,10 +3520,15 @@ def _prove_single_expression(
                         return 1e6
 
                 try:
-                    opt_adv = minimize(_neg_viol, x0_vec, method="L-BFGS-B", bounds=b_bounds, options={"maxiter": 80})
+                    adv_opts = (
+                        {"maxiter": 25, "maxfun": 75}
+                        if clause_uses_blackbox
+                        else {"maxiter": 80}
+                    )
+                    opt_adv = minimize(_neg_viol, x0_vec, method="L-BFGS-B", bounds=b_bounds, options=adv_opts)
                     if opt_adv.x is not None:
                         cand_adv = dict(best_sample_pt)
-                        for idx_c, cv_id in enumerate(cont_vars):
+                        for idx_c, cv_id in enumerate(clause_cont_vars):
                             cand_adv[cv_id] = float(opt_adv.x[idx_c])
                         w_adv = _check_clause_witness(cand_adv)
                         if w_adv is not None:

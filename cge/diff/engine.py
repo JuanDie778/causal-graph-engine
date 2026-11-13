@@ -25,6 +25,7 @@ import sympy as sp
 
 from ..audit import SystemAuditor
 from ..ingest import ASTIngestPipeline, compile_source_to_ir
+from ..ingest_adapters.engine import RepositoryCausalEngine
 from ..mcp.oracle import ActorDBOracle, _looks_like_inline_code
 from ..mcp.prover import (
     _MATH_FUNC_LOCALS,
@@ -169,6 +170,33 @@ def load_causal_graph(
         s = str(source).strip()
         if not s:
             raise CausalDiffError("Source string cannot be empty.")
+
+        repo_eng = RepositoryCausalEngine()
+        adapter_spec = repo_eng.resolve_adapter_source(s)
+        if adapter_spec is not None:
+            if "error_code" in adapter_spec:
+                raise CausalDiffError(adapter_spec["message"])
+            try:
+                adapter = repo_eng.get_adapter(adapter_spec["repo_id"], str(adapter_spec["repo_dir"]))
+                if adapter is None:
+                    raise CausalDiffError(f"No causal adapter registered for '{adapter_spec['repo_id']}'.")
+                sub_sel = adapter_spec["explicit_submodel"]
+                f_hint = adapter_spec["file_hint"]
+                if sub_sel is None and entrypoint:
+                    avail = adapter.list_submodels() if hasattr(adapter, "list_submodels") else []
+                    if entrypoint in avail:
+                        sub_sel = entrypoint
+                    else:
+                        f_hint = entrypoint
+                g = adapter.build_causal_graph(submodel=sub_sel, file_hint=f_hint)
+                if system_id:
+                    g.system_id = system_id
+                return g
+            except CausalDiffError:
+                raise
+            except Exception as exc:
+                raise CausalDiffError(f"Failed to compile adapter source '{s}': {exc}") from exc
+
         if os.path.isdir(s):
             g = ASTIngestPipeline(s, entrypoint=entrypoint).run()
             if system_id:
@@ -606,6 +634,165 @@ class CausalDiffEngine:
         self.fail_on_dead_nodes = bool(fail_on_dead_nodes)
         self._oracle = ActorDBOracle(allow_auto_discovery=False)
 
+    def _resolve_multi_submodel_adapter_pair(
+        self,
+        base: Union[CausalGraph, Dict[str, Any], str, Path],
+        head: Union[CausalGraph, Dict[str, Any], str, Path],
+        entrypoint: Optional[str],
+    ) -> Optional[List[Tuple[str, CausalGraph, CausalGraph]]]:
+        """Si `base` y `head` son el mismo repositorio adaptador multi-submodelo sin submodelo explícito, carga todos sus submodelos."""
+        if entrypoint is not None or not isinstance(base, (str, Path)) or not isinstance(head, (str, Path)):
+            return None
+        sb_str = str(base).strip()
+        sh_str = str(head).strip()
+        if not sb_str or not sh_str:
+            return None
+        repo_eng = RepositoryCausalEngine()
+        spec_b = repo_eng.resolve_adapter_source(sb_str)
+        spec_h = repo_eng.resolve_adapter_source(sh_str)
+        if (
+            not spec_b
+            or not spec_h
+            or "error_code" in spec_b
+            or "error_code" in spec_h
+            or spec_b.get("repo_id") != spec_h.get("repo_id")
+            or spec_b.get("explicit_submodel") is not None
+            or spec_h.get("explicit_submodel") is not None
+            or spec_b.get("file_hint") is not None
+            or spec_h.get("file_hint") is not None
+        ):
+            return None
+        adapter_b = repo_eng.get_adapter(spec_b["repo_id"], str(spec_b["repo_dir"]))
+        avail_subs = adapter_b.list_submodels() if (adapter_b and hasattr(adapter_b, "list_submodels")) else []
+        if len(avail_subs) <= 1:
+            return None
+        pairs: List[Tuple[str, CausalGraph, CausalGraph]] = []
+        for sub_name in avail_subs:
+            gb_sub = load_causal_graph(base, entrypoint=sub_name)
+            gh_sub = load_causal_graph(head, entrypoint=sub_name)
+            pairs.append((sub_name, gb_sub, gh_sub))
+        return pairs
+
+    @staticmethod
+    def _has_any_structural_change(sdiff: Dict[str, Any]) -> bool:
+        return bool(
+            sdiff.get("nodes_added")
+            or sdiff.get("nodes_removed")
+            or sdiff.get("nodes_semantically_modified")
+            or sdiff.get("edges_added")
+            or sdiff.get("edges_removed")
+            or sdiff.get("constraints_added")
+            or sdiff.get("constraints_removed")
+            or sdiff.get("constraints_semantically_modified")
+        )
+
+    def _merge_submodel_reports(
+        self,
+        sub_reports: List[Tuple[str, CausalDiffReport]],
+        git_metadata: Optional[Dict[str, Any]],
+    ) -> CausalDiffReport:
+        rank_map = {DiffVerdict.FAIL.value: 2, DiffVerdict.WARN.value: 1, DiffVerdict.PASS.value: 0}
+        ordered = sorted(
+            sub_reports,
+            key=lambda item: (
+                rank_map.get(item[1].verdict, 0),
+                len(item[1].invariant_regressions),
+                int(bool(item[1].policy_optimality.get("is_regression"))),
+            ),
+            reverse=True,
+        )
+        _, primary = ordered[0]
+
+        merged_inv_regs: List[Dict[str, Any]] = []
+        merged_inv_fixed: List[Dict[str, Any]] = []
+        merged_diags: List[Dict[str, Any]] = []
+        merged_added_dead: List[Dict[str, Any]] = []
+        merged_removed_dead: List[str] = []
+
+        sdiff_merged = dict(primary.structural_diff)
+        for list_k in (
+            "nodes_added",
+            "nodes_removed",
+            "nodes_semantically_modified",
+            "constraints_added",
+            "constraints_removed",
+            "constraints_semantically_modified",
+        ):
+            seen_items: List[str] = []
+            for _, rep in sub_reports:
+                for val_it in rep.structural_diff.get(list_k, []):
+                    if val_it not in seen_items:
+                        seen_items.append(val_it)
+            sdiff_merged[list_k] = seen_items
+        sdiff_merged["changed_submodels"] = [s for s, _ in sub_reports]
+
+        for sub_n, rep in sub_reports:
+            for ir_item in rep.invariant_regressions:
+                tagged = dict(ir_item)
+                tagged.setdefault("submodel", sub_n)
+                merged_inv_regs.append(tagged)
+            for if_item in rep.invariants_fixed:
+                tagged_f = dict(if_item)
+                tagged_f.setdefault("submodel", sub_n)
+                merged_inv_fixed.append(tagged_f)
+            for dg_item in rep.diagnostics:
+                tagged_d = dict(dg_item)
+                tagged_d.setdefault("submodel", sub_n)
+                merged_diags.append(tagged_d)
+            for dn_item in rep.dead_nodes.get("added_dead_nodes", []):
+                tagged_dn = dict(dn_item)
+                tagged_dn.setdefault("submodel", sub_n)
+                merged_added_dead.append(tagged_dn)
+            for r_id in rep.dead_nodes.get("removed_dead_node_ids", []):
+                if r_id not in merged_removed_dead:
+                    merged_removed_dead.append(r_id)
+
+        has_regs = any(rep.has_regressions for _, rep in sub_reports)
+        is_sem_eq = all(rep.is_semantically_equivalent for _, rep in sub_reports)
+        verdict = ordered[0][1].verdict
+
+        crit_cnt = sum(1 for d in merged_diags if d.get("severity") == "critical")
+        warn_cnt = sum(1 for d in merged_diags if d.get("severity") == "warning")
+        info_cnt = sum(1 for d in merged_diags if d.get("severity") == "info")
+
+        dead_merged = dict(primary.dead_nodes)
+        dead_merged["added_dead_nodes"] = merged_added_dead
+        dead_merged["removed_dead_node_ids"] = merged_removed_dead
+
+        summary = {
+            "verdict": verdict,
+            "has_regressions": has_regs,
+            "is_semantically_equivalent": is_sem_eq,
+            "changed_submodels": [s for s, _ in sub_reports],
+            "critical_count": crit_cnt,
+            "warning_count": warn_cnt,
+            "info_count": info_cnt,
+            "invariant_regressions_count": len(merged_inv_regs),
+            "dead_nodes_added_count": len(merged_added_dead),
+            "dead_nodes_removed_count": len(merged_removed_dead),
+            "policy_is_regression": any(bool(r.policy_optimality.get("is_regression")) for _, r in sub_reports),
+            "policy_changed": any(bool(r.policy_optimality.get("policy_changed")) for _, r in sub_reports),
+            "old_policy_became_infeasible": any(
+                bool(r.policy_optimality.get("old_policy_became_infeasible")) for _, r in sub_reports
+            ),
+        }
+        return CausalDiffReport(
+            base_system_id=primary.base_system_id,
+            head_system_id=primary.head_system_id,
+            verdict=verdict,
+            has_regressions=has_regs,
+            is_semantically_equivalent=is_sem_eq,
+            summary=summary,
+            invariant_regressions=merged_inv_regs,
+            invariants_fixed=merged_inv_fixed,
+            policy_optimality=primary.policy_optimality,
+            dead_nodes=dead_merged,
+            structural_diff=sdiff_merged,
+            epistemic_diff=primary.epistemic_diff,
+            diagnostics=merged_diags,
+            git_metadata=git_metadata,
+        )
+
     def diff(
         self,
         base: Union[CausalGraph, Dict[str, Any], str, Path],
@@ -614,6 +801,23 @@ class CausalDiffEngine:
         git_metadata: Optional[Dict[str, Any]] = None,
     ) -> CausalDiffReport:
         """Compara `base` (antes) contra `head` (después) y retorna un `CausalDiffReport` formal."""
+        submodel_pairs = self._resolve_multi_submodel_adapter_pair(base, head, entrypoint)
+        if submodel_pairs is not None:
+            changed_pairs = [
+                (sub_n, gb_s, gh_s)
+                for sub_n, gb_s, gh_s in submodel_pairs
+                if self._has_any_structural_change(self._compute_structural_diff(gb_s, gh_s))
+            ]
+            if len(changed_pairs) == 1:
+                _, gb_one, gh_one = changed_pairs[0]
+                return self.diff(gb_one, gh_one, git_metadata=git_metadata)
+            if len(changed_pairs) > 1:
+                sub_reps = [
+                    (sub_n, self.diff(gb_s, gh_s, git_metadata=git_metadata))
+                    for sub_n, gb_s, gh_s in changed_pairs
+                ]
+                return self._merge_submodel_reports(sub_reps, git_metadata=git_metadata)
+
         base_graph = load_causal_graph(base, entrypoint=entrypoint)
         head_graph = load_causal_graph(head, entrypoint=entrypoint)
 
@@ -625,6 +829,20 @@ class CausalDiffEngine:
         # 1. Diff Estructural y Equivalencia Simbólica de Mecanismos
         # ------------------------------------------------------------------
         structural_diff = self._compute_structural_diff(base_graph, head_graph)
+        for mod_item in structural_diff.get("nodes_modified", []):
+            bb_chg = (mod_item.get("changes") or {}).get("blackbox_mechanism")
+            if isinstance(bb_chg, dict) and not bb_chg.get("equivalent", True):
+                diagnostics.append({
+                    "code": "BLACKBOX_MECHANISM_MODIFIED",
+                    "category": "structural_diff",
+                    "severity": "warning",
+                    "node": mod_item["node"],
+                    "witness": bb_chg.get("witness"),
+                    "reason": (
+                        f"Blackbox mechanism for actor '{mod_item['node']}' diverges numerically "
+                        f"between base and head ({bb_chg.get('witness')})."
+                    ),
+                })
 
         base_cycles = _analyze_static_cycles(base_graph)
         head_cycles = _analyze_static_cycles(head_graph)
@@ -851,6 +1069,102 @@ class CausalDiffEngine:
     # Sub-analizadores Internos
     # ------------------------------------------------------------------
 
+    def _are_blackbox_nodes_equivalent(
+        self,
+        base_graph: CausalGraph,
+        head_graph: CausalGraph,
+        nid: str,
+        probe_states: Optional[List[Dict[str, float]]] = None,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Compara determinísticamente mecanismos `_blackbox_callables` de `nid` sobre puntos de prueba del dominio."""
+        bb_b = getattr(base_graph, "_blackbox_callables", {}) or {}
+        bb_h = getattr(head_graph, "_blackbox_callables", {}) or {}
+        if nid not in bb_b and nid not in bb_h:
+            return True, None
+        if (nid in bb_b) != (nid in bb_h):
+            return False, {"reason": "callable_presence_changed"}
+        args_b, fn_b = bb_b[nid]
+        args_h, fn_h = bb_h[nid]
+        if list(args_b) != list(args_h):
+            return False, {"reason": "callable_signature_changed", "base_args": list(args_b), "head_args": list(args_h)}
+
+        if probe_states is None:
+            shared_leaves = sorted(
+                lid
+                for lid in (set(base_graph.nodes) & set(head_graph.nodes))
+                if base_graph.nodes[lid].category in ("exogenous", "control")
+                and head_graph.nodes[lid].category in ("exogenous", "control")
+            )
+            b_map, int_doms = _compute_leaf_bounds(base_graph, shared_leaves)
+            leaf_probes: List[Dict[str, float]] = []
+            nom_p = {
+                lid: float(
+                    base_graph.nodes[lid].current_value
+                    if isinstance(base_graph.nodes[lid].current_value, (int, float))
+                    else 0.5 * (b_map[lid][0] + b_map[lid][1])
+                )
+                for lid in shared_leaves
+            }
+            leaf_probes.append(nom_p)
+            if shared_leaves:
+                leaf_probes.append({lid: b_map[lid][0] for lid in shared_leaves})
+                leaf_probes.append({lid: b_map[lid][1] for lid in shared_leaves})
+                for frac in (0.23, 0.5, 0.77):
+                    pt_f: Dict[str, float] = {}
+                    for idx_l, lid in enumerate(shared_leaves):
+                        lo_l, hi_l = b_map[lid]
+                        u_l = ((frac + 0.17 * idx_l) % 0.94) + 0.03
+                        v_l = lo_l + u_l * (hi_l - lo_l)
+                        pt_f[lid] = float(int(round(v_l))) if lid in int_doms else v_l
+                    leaf_probes.append(pt_f)
+
+            dag_b, _, _, fns_b = self._oracle._compile_graph_mechanisms(base_graph)
+            probe_states = []
+            if nx.is_directed_acyclic_graph(dag_b):
+                for lp in leaf_probes:
+                    try:
+                        st_p = self._oracle._evaluate_forward_with_do(base_graph, dag_b, fns_b, interventions=lp)
+                        probe_states.append(st_p)
+                    except Exception:
+                        continue
+
+        for st_probe in probe_states or []:
+            if not all(a in st_probe for a in args_b):
+                continue
+            arg_tuple = [float(st_probe[a]) for a in args_b]
+            err_b = False
+            err_h = False
+            vb = math.nan
+            vh = math.nan
+            try:
+                vb = float(fn_b(*arg_tuple))
+            except Exception:
+                err_b = True
+            try:
+                vh = float(fn_h(*arg_tuple))
+            except Exception:
+                err_h = True
+            if err_b != err_h:
+                return False, {
+                    "args": dict(zip(args_b, arg_tuple, strict=True)),
+                    "base_error": err_b,
+                    "head_error": err_h,
+                }
+            if not err_b:
+                if math.isfinite(vb) != math.isfinite(vh):
+                    return False, {
+                        "args": dict(zip(args_b, arg_tuple, strict=True)),
+                        "base_value": vb,
+                        "head_value": vh,
+                    }
+                if math.isfinite(vb) and abs(vb - vh) > 1e-6 * max(1.0, abs(vb), abs(vh)):
+                    return False, {
+                        "args": {k_a: round(v_a, 6) for k_a, v_a in zip(args_b, arg_tuple, strict=True)},
+                        "base_value": round(vb, 6),
+                        "head_value": round(vh, 6),
+                    }
+        return True, None
+
     def _compute_structural_diff(
         self, base_graph: CausalGraph, head_graph: CausalGraph
     ) -> Dict[str, Any]:
@@ -861,6 +1175,11 @@ class CausalDiffEngine:
         nodes_removed = sorted(b_nodes - h_nodes)
         nodes_modified: List[Dict[str, Any]] = []
         nodes_semantically_modified: List[str] = []
+
+        bb_present = bool(
+            getattr(base_graph, "_blackbox_callables", None) or getattr(head_graph, "_blackbox_callables", None)
+        )
+        cached_bb_probes: Optional[List[Dict[str, float]]] = None
 
         for nid in sorted(b_nodes & h_nodes):
             nb = base_graph.nodes[nid]
@@ -889,6 +1208,58 @@ class CausalDiffEngine:
                 }
                 if not alg_eq:
                     sem_changed = True
+            elif bb_present and nb.symbolic_expr is None and nh.symbolic_expr is None:
+                bb_b_map = getattr(base_graph, "_blackbox_callables", {}) or {}
+                bb_h_map = getattr(head_graph, "_blackbox_callables", {}) or {}
+                if nid in bb_b_map or nid in bb_h_map:
+                    if cached_bb_probes is None:
+                        shared_leaves = sorted(
+                            lid
+                            for lid in (b_nodes & h_nodes)
+                            if base_graph.nodes[lid].category in ("exogenous", "control")
+                            and head_graph.nodes[lid].category in ("exogenous", "control")
+                        )
+                        b_map, int_doms = _compute_leaf_bounds(base_graph, shared_leaves)
+                        leaf_probes: List[Dict[str, float]] = [
+                            {
+                                lid: float(
+                                    base_graph.nodes[lid].current_value
+                                    if isinstance(base_graph.nodes[lid].current_value, (int, float))
+                                    else 0.5 * (b_map[lid][0] + b_map[lid][1])
+                                )
+                                for lid in shared_leaves
+                            }
+                        ]
+                        if shared_leaves:
+                            leaf_probes.append({lid: b_map[lid][0] for lid in shared_leaves})
+                            leaf_probes.append({lid: b_map[lid][1] for lid in shared_leaves})
+                            for frac in (0.23, 0.5, 0.77):
+                                pt_f = {}
+                                for idx_l, lid in enumerate(shared_leaves):
+                                    lo_l, hi_l = b_map[lid]
+                                    u_l = ((frac + 0.17 * idx_l) % 0.94) + 0.03
+                                    v_l = lo_l + u_l * (hi_l - lo_l)
+                                    pt_f[lid] = float(int(round(v_l))) if lid in int_doms else v_l
+                                leaf_probes.append(pt_f)
+                        dag_b, _, _, fns_b = self._oracle._compile_graph_mechanisms(base_graph)
+                        cached_bb_probes = []
+                        if nx.is_directed_acyclic_graph(dag_b):
+                            for lp in leaf_probes:
+                                try:
+                                    cached_bb_probes.append(
+                                        self._oracle._evaluate_forward_with_do(base_graph, dag_b, fns_b, interventions=lp)
+                                    )
+                                except Exception:
+                                    continue
+                    bb_eq, bb_wit = self._are_blackbox_nodes_equivalent(
+                        base_graph, head_graph, nid, probe_states=cached_bb_probes
+                    )
+                    if not bb_eq:
+                        changes["blackbox_mechanism"] = {
+                            "equivalent": False,
+                            "witness": bb_wit,
+                        }
+                        sem_changed = True
 
             if changes:
                 nodes_modified.append({

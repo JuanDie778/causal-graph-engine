@@ -15,7 +15,6 @@ from cge.ingest_adapters import (
     QuantEconCausalAdapter,
     QueryContext,
     RepositoryCausalEngine,
-    StaticRepoASTExtractor,
     SupplyChainCausalAdapter,
 )
 from cge.solver import solve_problem

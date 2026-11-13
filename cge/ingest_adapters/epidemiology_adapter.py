@@ -1,9 +1,9 @@
 """Adaptador de ingesta estática AST y simulación continua EDO RK45 para `epidemiology_seir`."""
 from __future__ import annotations
 
-import math
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import networkx as nx
 import numpy as np
@@ -11,15 +11,18 @@ import sympy as sp
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize_scalar
 
+from ..schema import CausalGraph, Constraint
 from .base import (
     AdapterResponse,
     QueryContext,
     StaticRepoASTExtractor,
+    build_verified_causal_graph,
     collect_session_epistemic_facts,
     compute_symbolic_sensitivities,
     detect_pressure_attempt,
     extract_dead_node_candidates_from_prompt,
     extract_inline_numeric_assignments,
+    make_verified_node,
     normalize_math_unicode,
     split_sensitivity_clauses,
 )
@@ -29,6 +32,7 @@ class EpidemiologyCausalAdapter:
     """Compila estáticamente `epidemiology_seir` (`seir_model.py` y `metrics.py`) a sistema dinámico verificable."""
 
     REPO_ID = "epidemiology_seir"
+    SUBMODELS: Tuple[str, ...] = ("seir_analytic", "seir_trajectory")
 
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
@@ -39,11 +43,11 @@ class EpidemiologyCausalAdapter:
 
     def _verify_symbolic_ode_conservation(self) -> bool:
         """Verifica simbólicamente sobre las expresiones del sistema SEIR que dS/dt + dE/dt + dI/dt + dR/dt == 0."""
-        S, E, I, R, N, beta, sigma, gamma = sp.symbols("S E I R N beta sigma gamma", real=True)
-        dS = -(beta * S * I) / N
-        dE = (beta * S * I) / N - sigma * E
-        dI = sigma * E - gamma * I
-        dR = gamma * I
+        S, E, inf_sym, R, N, beta, sigma, gamma = sp.symbols("S E I R N beta sigma gamma", real=True)
+        dS = -(beta * S * inf_sym) / N
+        dE = (beta * S * inf_sym) / N - sigma * E
+        dI = sigma * E - gamma * inf_sym
+        dR = gamma * inf_sym
         return sp.simplify(dS + dE + dI + dR) == 0
 
     def _build_static_lineage_dag(self) -> nx.DiGraph:
@@ -83,10 +87,10 @@ class EpidemiologyCausalAdapter:
 
     @staticmethod
     def _seir_rhs(t: float, y: np.ndarray, N: float, beta: float, sigma: float, gamma: float) -> np.ndarray:
-        S, E, I, R = y
-        inf_flow = (beta * S * I) / N
+        S, E, inf_pop, R = y
+        inf_flow = (beta * S * inf_pop) / N
         inc_flow = sigma * E
-        rec_flow = gamma * I
+        rec_flow = gamma * inf_pop
         return np.array([-inf_flow, inf_flow - inc_flow, inc_flow - rec_flow, rec_flow], dtype=float)
 
     def _simulate_seir_exact(
@@ -112,16 +116,16 @@ class EpidemiologyCausalAdapter:
             rtol=1e-7,
             atol=1e-9,
         )
-        S, E, I, R = sol.y[0], sol.y[1], sol.y[2], sol.y[3]
-        total_pop = S + E + I + R
+        S, E, inf_traj, R = sol.y[0], sol.y[1], sol.y[2], sol.y[3]
+        total_pop = S + E + inf_traj + R
         max_viol = float(np.max(np.abs(total_pop - N)))
-        peak_idx = int(np.argmax(I))
+        peak_idx = int(np.argmax(inf_traj))
         return {
             "S_end": float(S[-1]),
             "E_end": float(E[-1]),
-            "I_end": float(I[-1]),
+            "I_end": float(inf_traj[-1]),
             "R_end": float(R[-1]),
-            "peak_infection": float(I[peak_idx]),
+            "peak_infection": float(inf_traj[peak_idx]),
             "time_of_peak": float(sol.t[peak_idx]),
             "final_recovered": float(R[-1]),
             "final_susceptible": float(S[-1]),
@@ -1034,3 +1038,687 @@ class EpidemiologyCausalAdapter:
             confidence_claim="UNSUPPORTED_DOMAIN",
             raw_answer=f"Consulta '{q}' no soportada.",
         )
+
+    def list_submodels(self) -> List[str]:
+        return list(self.SUBMODELS)
+
+    def default_submodel(self) -> str:
+        return "seir_analytic"
+
+    def infer_submodel(
+        self,
+        target_id: Optional[str] = None,
+        actor_hints: Optional[Sequence[str]] = None,
+        file_hint: Optional[str] = None,
+    ) -> str:
+        hints: Set[str] = set(actor_hints or [])
+        if target_id:
+            hints.add(target_id)
+
+        traj_actors = {
+            "peak_infection",
+            "time_of_peak",
+            "final_recovered",
+            "final_susceptible",
+            "final_exposed",
+            "final_infected",
+            "intervened_peak_infection",
+            "S0",
+            "E0",
+            "I0",
+            "R0_init",
+            "t_max",
+            "t_intervention",
+            "intervention_beta",
+        }
+        analytic_actors = {
+            "S",
+            "E",
+            "I",
+            "R",
+            "dS_dt",
+            "dE_dt",
+            "dI_dt",
+            "dR_dt",
+            "herd_immunity_threshold",
+        }
+        if hints & traj_actors:
+            return "seir_trajectory"
+        if hints & analytic_actors:
+            return "seir_analytic"
+        if file_hint and Path(file_hint).name.lower() == "seir_model.py":
+            return "seir_trajectory"
+        return self.default_submodel()
+
+    def build_causal_graph(
+        self,
+        submodel: Optional[str] = None,
+        target_hint: Optional[str] = None,
+        actor_hints: Optional[Sequence[str]] = None,
+        file_hint: Optional[str] = None,
+    ) -> CausalGraph:
+        """Compila un submodelo autocontenido de `epidemiology_seir` desde el AST vivo a `CausalGraph`."""
+        chosen = (submodel or "").strip() or self.infer_submodel(
+            target_id=target_hint,
+            actor_hints=actor_hints,
+            file_hint=file_hint,
+        )
+        if chosen not in self.SUBMODELS:
+            raise ValueError(
+                f"Unknown submodel '{chosen}' for '{self.REPO_ID}'. Available submodels: {list(self.SUBMODELS)}"
+            )
+
+        base_meta = {
+            "repo_id": self.REPO_ID,
+            "submodel": chosen,
+            "available_submodels": list(self.SUBMODELS),
+            "source_path": self.repo_path,
+        }
+
+        r0_fn = self.extractor.functions.get("calculate_r0")
+        hit_fn = self.extractor.functions.get("calculate_herd_immunity_threshold")
+        ode_fn = self.extractor.functions.get("seir_ode")
+        sim_fn = self.extractor.functions.get("simulate_seir")
+
+        metrics_file = r0_fn.rel_file if r0_fn else "epidemiology_seir/metrics.py"
+        ode_file = ode_fn.rel_file if ode_fn else "epidemiology_seir/seir_model.py"
+
+        sym_N = sp.Symbol("N", real=True)
+        sym_S = sp.Symbol("S", real=True)
+        sym_E = sp.Symbol("E", real=True)
+        sym_I = sp.Symbol("I", real=True)
+        sym_R = sp.Symbol("R", real=True)
+        sym_beta = sp.Symbol("beta", real=True)
+        sym_sigma = sp.Symbol("sigma", real=True)
+        sym_gamma = sp.Symbol("gamma", real=True)
+        sym_r0 = sp.Symbol("r0", real=True)
+
+        r0_expr = (
+            r0_fn.sympy_expr
+            if (r0_fn and r0_fn.sympy_expr is not None)
+            else (sym_beta / sym_gamma)
+        )
+        hit_expr = (
+            hit_fn.sympy_expr
+            if (hit_fn and hit_fn.sympy_expr is not None)
+            else sp.Max(sp.Float(0.0), sp.Float(1.0) - sp.Float(1.0) / sym_r0)
+        )
+
+        if chosen == "seir_analytic":
+            ode_eqs = self.extractor.extract_structural_equations(
+                "seir_ode",
+                keep_symbols={
+                    "dS_dt": "dS_dt",
+                    "dE_dt": "dE_dt",
+                    "dI_dt": "dI_dt",
+                    "dR_dt": "dR_dt",
+                },
+                seed_env={
+                    "y": (sym_S, sym_E, sym_I, sym_R)
+                },
+            )
+            ds_expr, ds_line = ode_eqs.get("dS_dt", (-(sym_beta * sym_S * sym_I) / sym_N, 17))
+            de_expr, de_line = ode_eqs.get("dE_dt", ((sym_beta * sym_S * sym_I) / sym_N - sym_sigma * sym_E, 18))
+            di_expr, di_line = ode_eqs.get("dI_dt", (sym_sigma * sym_E - sym_gamma * sym_I, 19))
+            dr_expr, dr_line = ode_eqs.get("dR_dt", (sym_gamma * sym_I, 20))
+
+            n_nom, s_nom, e_nom, i_nom, r_nom = 10000.0, 9990.0, 5.0, 5.0, 0.0
+            beta_nom, sigma_nom, gamma_nom = 0.5, 0.2, 0.1
+            subs_nom = {
+                sp.Symbol("N", real=True): n_nom,
+                sp.Symbol("S", real=True): s_nom,
+                sp.Symbol("E", real=True): e_nom,
+                sp.Symbol("I", real=True): i_nom,
+                sp.Symbol("R", real=True): r_nom,
+                sp.Symbol("beta", real=True): beta_nom,
+                sp.Symbol("sigma", real=True): sigma_nom,
+                sp.Symbol("gamma", real=True): gamma_nom,
+            }
+            ds_val = float(ds_expr.evalf(subs=subs_nom))
+            de_val = float(de_expr.evalf(subs=subs_nom))
+            di_val = float(di_expr.evalf(subs=subs_nom))
+            dr_val = float(dr_expr.evalf(subs=subs_nom))
+            r0_val = float(r0_expr.evalf(subs=subs_nom))
+            subs_nom[sp.Symbol("r0", real=True)] = r0_val
+            hit_val = float(hit_expr.evalf(subs=subs_nom))
+
+            nodes = [
+                make_verified_node(
+                    "N",
+                    "exogenous",
+                    ode_file,
+                    "N",
+                    8,
+                    current_value=n_nom,
+                    bounds={"min": 100.0, "max": 1e7},
+                ),
+                make_verified_node(
+                    "S",
+                    "exogenous",
+                    ode_file,
+                    "S",
+                    16,
+                    current_value=s_nom,
+                    bounds={"min": 0.0, "max": 10000.0},
+                ),
+                make_verified_node(
+                    "E",
+                    "exogenous",
+                    ode_file,
+                    "E",
+                    16,
+                    current_value=e_nom,
+                    bounds={"min": 0.0, "max": 10000.0},
+                ),
+                make_verified_node(
+                    "I",
+                    "exogenous",
+                    ode_file,
+                    "I",
+                    16,
+                    current_value=i_nom,
+                    bounds={"min": 0.0, "max": 10000.0},
+                ),
+                make_verified_node(
+                    "R",
+                    "exogenous",
+                    ode_file,
+                    "R",
+                    16,
+                    current_value=r_nom,
+                    bounds={"min": 0.0, "max": 10000.0},
+                ),
+                make_verified_node(
+                    "sigma",
+                    "exogenous",
+                    ode_file,
+                    "sigma",
+                    8,
+                    current_value=sigma_nom,
+                    bounds={"min": 0.01, "max": 2.0},
+                ),
+                make_verified_node(
+                    "gamma",
+                    "exogenous",
+                    metrics_file,
+                    "gamma",
+                    7,
+                    current_value=gamma_nom,
+                    bounds={"min": 0.01, "max": 2.0},
+                ),
+                make_verified_node(
+                    "beta",
+                    "control",
+                    metrics_file,
+                    "beta",
+                    7,
+                    current_value=beta_nom,
+                    bounds={"min": 0.01, "max": 2.0},
+                ),
+                make_verified_node(
+                    "dS_dt",
+                    "state",
+                    ode_file,
+                    "seir_ode",
+                    ds_line,
+                    current_value=ds_val,
+                    symbolic_expr=str(ds_expr),
+                ),
+                make_verified_node(
+                    "dE_dt",
+                    "state",
+                    ode_file,
+                    "seir_ode",
+                    de_line,
+                    current_value=de_val,
+                    symbolic_expr=str(de_expr),
+                ),
+                make_verified_node(
+                    "dI_dt",
+                    "state",
+                    ode_file,
+                    "seir_ode",
+                    di_line,
+                    current_value=di_val,
+                    symbolic_expr=str(di_expr),
+                ),
+                make_verified_node(
+                    "dR_dt",
+                    "state",
+                    ode_file,
+                    "seir_ode",
+                    dr_line,
+                    current_value=dr_val,
+                    symbolic_expr=str(dr_expr),
+                ),
+                make_verified_node(
+                    "r0",
+                    "state",
+                    metrics_file,
+                    "calculate_r0",
+                    r0_fn.lineno if r0_fn else 7,
+                    current_value=r0_val,
+                    symbolic_expr=str(r0_expr),
+                ),
+                make_verified_node(
+                    "herd_immunity_threshold",
+                    "target",
+                    metrics_file,
+                    "calculate_herd_immunity_threshold",
+                    hit_fn.lineno if hit_fn else 18,
+                    current_value=hit_val,
+                    symbolic_expr=str(hit_expr),
+                ),
+            ]
+            node_ids = {n.id for n in nodes}
+            edges: List[Tuple[str, str]] = []
+            for dst_id, expr_obj in (
+                ("dS_dt", ds_expr),
+                ("dE_dt", de_expr),
+                ("dI_dt", di_expr),
+                ("dR_dt", dr_expr),
+                ("r0", r0_expr),
+                ("herd_immunity_threshold", hit_expr),
+            ):
+                for sym in sorted(expr_obj.free_symbols, key=lambda s: s.name):
+                    if sym.name in node_ids and sym.name != dst_id:
+                        edges.append((sym.name, dst_id))
+
+            constraints = [
+                Constraint(
+                    id="c_ode_mass_conservation",
+                    type="hard",
+                    expression="dS_dt + dE_dt + dI_dt + dR_dt == 0.0",
+                    description="Closed-population SEIR ODE rates sum identically to zero.",
+                ),
+                Constraint(
+                    id="c_hit_bounds",
+                    type="hard",
+                    expression="0.0 <= herd_immunity_threshold and herd_immunity_threshold < 1.0",
+                    description="Herd immunity threshold lies in [0, 1).",
+                ),
+            ]
+            return build_verified_causal_graph(
+                system_id="epidemiology_seir_analytic",
+                nodes=nodes,
+                edges=edges,
+                constraints=constraints,
+                metadata={"sense": "min", **base_meta},
+            )
+
+        # chosen == "seir_trajectory"
+        sym_t = sp.Symbol("t", real=True)
+        ode_eqs_tr = self.extractor.extract_structural_equations(
+            "seir_ode",
+            keep_symbols={
+                "dS_dt": "dS_dt",
+                "dE_dt": "dE_dt",
+                "dI_dt": "dI_dt",
+                "dR_dt": "dR_dt",
+            },
+            seed_env={
+                "t": sym_t,
+                "y": (sym_S, sym_E, sym_I, sym_R),
+            },
+        )
+        ds_tr = ode_eqs_tr.get("dS_dt", (-(sym_beta * sym_S * sym_I) / sym_N, 17))[0]
+        de_tr = ode_eqs_tr.get("dE_dt", ((sym_beta * sym_S * sym_I) / sym_N - sym_sigma * sym_E, 18))[0]
+        di_tr = ode_eqs_tr.get("dI_dt", (sym_sigma * sym_E - sym_gamma * sym_I, 19))[0]
+        dr_tr = ode_eqs_tr.get("dR_dt", (sym_gamma * sym_I, 20))[0]
+        ode_rhs_fn = sp.lambdify(
+            [sym_t, sym_S, sym_E, sym_I, sym_R, sym_N, sym_beta, sym_sigma, sym_gamma],
+            (ds_tr, de_tr, di_tr, dr_tr),
+            modules="math",
+        )
+
+        def live_ode_fn(
+            t: float,
+            y: np.ndarray,
+            N: float,
+            beta: float,
+            sigma: float,
+            gamma: float,
+        ) -> Tuple[float, float, float, float]:
+            return ode_rhs_fn(float(t), float(y[0]), float(y[1]), float(y[2]), float(y[3]), N, beta, sigma, gamma)
+
+        sim_cache: Dict[Tuple[float, ...], Dict[str, float]] = {}
+        two_phase_cache: Dict[Tuple[float, ...], float] = {}
+
+        def _eval_traj(
+            N: float,
+            S0: float,
+            E0: float,
+            I0: float,
+            R0_init: float,
+            beta: float,
+            sigma: float,
+            gamma: float,
+            t_max: float,
+        ) -> Dict[str, float]:
+            n_f, s0_f, e0_f, i0_f, r0_f = float(N), float(S0), float(E0), float(I0), float(R0_init)
+            b_f, sig_f, gam_f, tm_f = float(beta), float(sigma), float(gamma), float(t_max)
+            if n_f <= 0.0 or s0_f < 0.0 or e0_f < 0.0 or i0_f < 0.0 or r0_f < 0.0:
+                raise ValueError("Compartments must be non-negative and N > 0.")
+            if b_f < 0.0 or sig_f < 0.0 or gam_f <= 0.0 or tm_f <= 0.0:
+                raise ValueError("Rates must be non-negative with gamma > 0 and t_max > 0.")
+            key = (
+                round(n_f, 9),
+                round(s0_f, 9),
+                round(e0_f, 9),
+                round(i0_f, 9),
+                round(r0_f, 9),
+                round(b_f, 9),
+                round(sig_f, 9),
+                round(gam_f, 9),
+                round(tm_f, 9),
+            )
+            if key in sim_cache:
+                return sim_cache[key]
+            t_eval = np.linspace(0.0, tm_f, 400)
+            sol = solve_ivp(
+                fun=lambda t, y: live_ode_fn(t, y, n_f, b_f, sig_f, gam_f),
+                t_span=(0.0, tm_f),
+                y0=[s0_f, e0_f, i0_f, r0_f],
+                t_eval=t_eval,
+                method="RK45",
+                rtol=1e-7,
+                atol=1e-9,
+            )
+            s_arr, e_arr, i_arr, r_arr = sol.y[0], sol.y[1], sol.y[2], sol.y[3]
+            pk_idx = int(np.argmax(i_arr))
+            out_d = {
+                "final_susceptible": float(s_arr[-1]),
+                "final_exposed": float(e_arr[-1]),
+                "final_infected": float(i_arr[-1]),
+                "final_recovered": float(r_arr[-1]),
+                "time_of_peak": float(sol.t[pk_idx]),
+                "peak_infection": float(i_arr[pk_idx]),
+            }
+            if len(sim_cache) >= 2048:
+                sim_cache.pop(next(iter(sim_cache)))
+            sim_cache[key] = out_d
+            return out_d
+
+        def _eval_intervened_peak(
+            N: float,
+            S0: float,
+            E0: float,
+            I0: float,
+            R0_init: float,
+            beta: float,
+            intervention_beta: float,
+            sigma: float,
+            gamma: float,
+            t_intervention: float,
+            t_max: float,
+        ) -> float:
+            ti_f = max(1e-3, min(float(t_max) - 1e-3, float(t_intervention)))
+            key = (
+                round(float(N), 9),
+                round(float(S0), 9),
+                round(float(E0), 9),
+                round(float(I0), 9),
+                round(float(R0_init), 9),
+                round(float(beta), 9),
+                round(float(intervention_beta), 9),
+                round(float(sigma), 9),
+                round(float(gamma), 9),
+                round(ti_f, 9),
+                round(float(t_max), 9),
+            )
+            if key in two_phase_cache:
+                return two_phase_cache[key]
+            p1 = _eval_traj(N, S0, E0, I0, R0_init, beta, sigma, gamma, ti_f)
+            p2 = _eval_traj(
+                N,
+                p1["final_susceptible"],
+                p1["final_exposed"],
+                p1["final_infected"],
+                p1["final_recovered"],
+                intervention_beta,
+                sigma,
+                gamma,
+                max(1e-3, float(t_max) - ti_f),
+            )
+            val = max(p1["peak_infection"], p2["peak_infection"])
+            if len(two_phase_cache) >= 2048:
+                two_phase_cache.pop(next(iter(two_phase_cache)))
+            two_phase_cache[key] = val
+            return val
+
+        n_nom, e0_nom, i0_nom, r0i_nom = 10000.0, 0.0, 10.0, 0.0
+        s0_nom = n_nom - e0_nom - i0_nom - r0i_nom
+        beta_nom, int_beta_nom, sig_nom, gam_nom = 0.5, 0.25, 0.2, 0.1
+        ti_nom, tm_nom = 30.0, 160.0
+        nom_tr = _eval_traj(n_nom, s0_nom, e0_nom, i0_nom, r0i_nom, beta_nom, sig_nom, gam_nom, tm_nom)
+        nom_int_pk = _eval_intervened_peak(
+            n_nom, s0_nom, e0_nom, i0_nom, r0i_nom, beta_nom, int_beta_nom, sig_nom, gam_nom, ti_nom, tm_nom
+        )
+        lineno = sim_fn.lineno if sim_fn else 24
+
+        nodes = [
+            make_verified_node(
+                "N", "exogenous", ode_file, "N", lineno, current_value=n_nom, bounds={"min": 500.0, "max": 1e6}
+            ),
+            make_verified_node(
+                "E0", "exogenous", ode_file, "E0", lineno, current_value=e0_nom, bounds={"min": 0.0, "max": 100.0}
+            ),
+            make_verified_node(
+                "I0", "exogenous", ode_file, "I0", lineno, current_value=i0_nom, bounds={"min": 1.0, "max": 100.0}
+            ),
+            make_verified_node(
+                "R0_init",
+                "exogenous",
+                ode_file,
+                "R0_init",
+                lineno,
+                current_value=r0i_nom,
+                bounds={"min": 0.0, "max": 100.0},
+            ),
+            make_verified_node(
+                "sigma",
+                "exogenous",
+                ode_file,
+                "sigma",
+                lineno,
+                current_value=sig_nom,
+                bounds={"min": 0.05, "max": 1.0},
+            ),
+            make_verified_node(
+                "gamma",
+                "exogenous",
+                ode_file,
+                "gamma",
+                lineno,
+                current_value=gam_nom,
+                bounds={"min": 0.05, "max": 1.0},
+            ),
+            make_verified_node(
+                "t_max",
+                "exogenous",
+                ode_file,
+                "t_max",
+                lineno,
+                current_value=tm_nom,
+                bounds={"min": 20.0, "max": 365.0},
+            ),
+            make_verified_node(
+                "t_intervention",
+                "exogenous",
+                metrics_file,
+                "t_intervention",
+                29,
+                current_value=ti_nom,
+                bounds={"min": 1.0, "max": 150.0},
+            ),
+            make_verified_node(
+                "intervention_beta",
+                "exogenous",
+                metrics_file,
+                "intervention_beta",
+                29,
+                current_value=int_beta_nom,
+                bounds={"min": 0.02, "max": 1.5},
+            ),
+            make_verified_node(
+                "beta",
+                "control",
+                ode_file,
+                "beta",
+                lineno,
+                current_value=beta_nom,
+                bounds={"min": 0.02, "max": 1.5},
+            ),
+            make_verified_node(
+                "S0",
+                "state",
+                ode_file,
+                "simulate_seir",
+                lineno,
+                current_value=s0_nom,
+                symbolic_expr="Max(0.0, N - E0 - I0 - R0_init)",
+            ),
+            make_verified_node(
+                "r0",
+                "state",
+                metrics_file,
+                "calculate_r0",
+                7,
+                current_value=beta_nom / gam_nom,
+                symbolic_expr=str(r0_expr),
+            ),
+            make_verified_node(
+                "final_susceptible",
+                "state",
+                ode_file,
+                "simulate_seir",
+                lineno,
+                current_value=nom_tr["final_susceptible"],
+                symbolic_expr=None,
+            ),
+            make_verified_node(
+                "final_exposed",
+                "state",
+                ode_file,
+                "simulate_seir",
+                lineno,
+                current_value=nom_tr["final_exposed"],
+                symbolic_expr=None,
+            ),
+            make_verified_node(
+                "final_infected",
+                "state",
+                ode_file,
+                "simulate_seir",
+                lineno,
+                current_value=nom_tr["final_infected"],
+                symbolic_expr=None,
+            ),
+            make_verified_node(
+                "final_recovered",
+                "state",
+                ode_file,
+                "simulate_seir",
+                lineno,
+                current_value=nom_tr["final_recovered"],
+                symbolic_expr=None,
+            ),
+            make_verified_node(
+                "time_of_peak",
+                "state",
+                ode_file,
+                "simulate_seir",
+                lineno,
+                current_value=nom_tr["time_of_peak"],
+                symbolic_expr=None,
+            ),
+            make_verified_node(
+                "intervened_peak_infection",
+                "state",
+                metrics_file,
+                "calculate_intervention_impact",
+                29,
+                current_value=nom_int_pk,
+                symbolic_expr=None,
+            ),
+            make_verified_node(
+                "peak_infection",
+                "target",
+                ode_file,
+                "simulate_seir",
+                lineno,
+                current_value=nom_tr["peak_infection"],
+                symbolic_expr=None,
+            ),
+        ]
+        traj_params = ["N", "S0", "E0", "I0", "R0_init", "beta", "sigma", "gamma", "t_max"]
+        int_params = [
+            "N",
+            "S0",
+            "E0",
+            "I0",
+            "R0_init",
+            "beta",
+            "intervention_beta",
+            "sigma",
+            "gamma",
+            "t_intervention",
+            "t_max",
+        ]
+        traj_outputs = (
+            "final_susceptible",
+            "final_exposed",
+            "final_infected",
+            "final_recovered",
+            "time_of_peak",
+            "peak_infection",
+        )
+        edges = [
+            ("N", "S0"),
+            ("E0", "S0"),
+            ("I0", "S0"),
+            ("R0_init", "S0"),
+            ("beta", "r0"),
+            ("gamma", "r0"),
+        ]
+        for out_k in traj_outputs:
+            for p_k in traj_params:
+                edges.append((p_k, out_k))
+        for p_k in int_params:
+            edges.append((p_k, "intervened_peak_infection"))
+
+        constraints = [
+            Constraint(
+                id="c_population_conservation",
+                type="hard",
+                expression="final_susceptible + final_exposed + final_infected + final_recovered == N",
+                description="Total population S(t) + E(t) + I(t) + R(t) == N is conserved along RK45 trajectories.",
+            ),
+            Constraint(
+                id="c_peak_bounds",
+                type="hard",
+                expression="0.0 <= peak_infection and peak_infection <= N and 0.0 <= intervened_peak_infection and intervened_peak_infection <= N",
+                description="Peak infected headcount stays bounded in [0, N].",
+            ),
+            Constraint(
+                id="c_time_and_r0_bounds",
+                type="hard",
+                expression="0.0 <= time_of_peak and time_of_peak <= t_max and r0 >= 0.0",
+                description="Peak time lies inside [0, t_max] and basic reproduction number R0 is non-negative.",
+            ),
+        ]
+        ir = build_verified_causal_graph(
+            system_id="epidemiology_seir_trajectory",
+            nodes=nodes,
+            edges=edges,
+            constraints=constraints,
+            metadata={"sense": "min", **base_meta},
+        )
+
+        def _make_traj_metric(metric_key: str):
+            return lambda *args: float(_eval_traj(*args)[metric_key])
+
+        bb_map: Dict[str, Any] = {out_k: (list(traj_params), _make_traj_metric(out_k)) for out_k in traj_outputs}
+        bb_map["intervened_peak_infection"] = (list(int_params), _eval_intervened_peak)
+        ir._blackbox_callables = bb_map
+        return ir

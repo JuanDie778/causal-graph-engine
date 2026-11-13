@@ -6,10 +6,7 @@ Remediated for Iteration 2 (accurate CLI flags for ground_truth, BenchmarkTask c
 
 from __future__ import annotations
 import json
-import os
 import re
-from pathlib import Path
-from typing import Dict, Any, List
 import pytest
 
 pytestmark = [pytest.mark.tier2, pytest.mark.e2e]
@@ -327,14 +324,24 @@ class TestReportBoundaries:
     def test_report_missing_baseline_argument(self, run_cli, report_script):
         """T2-RP-01: Running report.py without arguments defaults to baseline_v0 or reports usage."""
         assert report_script.exists(), f"report.py missing at {report_script}"
-        res = run_cli([str(report_script)], timeout=30.0)
-        assert res.returncode in (0, 2), f"Unexpected returncode {res.returncode}"
+        summary_path = report_script.parent / "baseline_v0_summary.json"
+        orig_bytes = summary_path.read_bytes() if summary_path.exists() else None
+        try:
+            res = run_cli([str(report_script)], timeout=30.0)
+            assert res.returncode in (0, 2), f"Unexpected returncode {res.returncode}"
+        finally:
+            if orig_bytes is not None:
+                summary_path.write_bytes(orig_bytes)
 
     def test_report_nonexistent_baseline_tag(self, run_cli, report_script):
         """T2-RP-02: Running report.py with unknown baseline tag handles execution cleanly."""
         assert report_script.exists(), f"report.py missing at {report_script}"
-        res = run_cli([str(report_script), "--baseline", "nonexistent_baseline_tag_xyz"], timeout=30.0)
-        assert res.returncode in (0, 1, 2), f"Unexpected returncode {res.returncode}"
+        bogus_out = report_script.parent / "nonexistent_baseline_tag_xyz_summary.json"
+        try:
+            res = run_cli([str(report_script), "--baseline", "nonexistent_baseline_tag_xyz"], timeout=30.0)
+            assert res.returncode in (0, 1, 2), f"Unexpected returncode {res.returncode}"
+        finally:
+            bogus_out.unlink(missing_ok=True)
 
     def test_report_relative_score_zero_division(self, run_cli, repo_root):
         """T2-RP-03: Relative score calculation when B1 score is 0.0 uses max(0.05, B1) avoiding zero division."""
@@ -465,7 +472,7 @@ class TestManifestBoundaries:
         if not manifest_path.exists():
             pytest.skip("baseline_v0_manifest.json is a Milestone 4 deliverable (not yet created)")
         with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest_data = json.load(f)
+            _ = json.load(f)
 
         test_file = isolated_sandbox / "sample_test_file.txt"
         test_file.write_text("Original content line\n", encoding="utf-8")

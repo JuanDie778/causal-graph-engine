@@ -1,13 +1,16 @@
 """Adaptador de ingesta estática AST y resolución causal para `loan_tax_engine` (IRPF + Amortización Francesa)."""
 from __future__ import annotations
 
+import ast
 import math
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import networkx as nx
 import sympy as sp
 
+from ..ingest import ASTFunctionToSymPy
 from ..schema import CausalGraph, Constraint
 from ..solver import solve_problem
 from .base import (
@@ -29,6 +32,7 @@ class LoanTaxCausalAdapter:
     """Compila estáticamente `loan_tax_engine` (`amortization.py` y `tax_brackets.py`) a IR ejecutable CGE."""
 
     REPO_ID = "loan_tax_engine"
+    SUBMODELS: Tuple[str, ...] = ("tax_brackets", "tax_rates", "amortization")
 
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
@@ -1852,4 +1856,426 @@ class LoanTaxCausalAdapter:
             parsed_output=None,
             confidence_claim="UNSUPPORTED_DOMAIN",
             raw_answer=f"Consulta '{q}' no soportada.",
+        )
+
+    def list_submodels(self) -> List[str]:
+        return list(self.SUBMODELS)
+
+    def default_submodel(self) -> str:
+        return "tax_brackets"
+
+    def infer_submodel(
+        self,
+        target_id: Optional[str] = None,
+        actor_hints: Optional[Sequence[str]] = None,
+        file_hint: Optional[str] = None,
+    ) -> str:
+        hints: Set[str] = set(actor_hints or [])
+        if target_id:
+            hints.add(target_id)
+
+        amort_actors = {
+            "principal",
+            "annual_rate",
+            "periods",
+            "freq_per_year",
+            "periodic_rate",
+            "payment_per_period",
+            "total_paid",
+            "total_interest",
+            "total_principal",
+            "max_monthly_payment",
+        }
+        if hints & amort_actors:
+            return "amortization"
+        if hints & {"effective_rate", "marginal_rate"}:
+            return "tax_rates"
+
+        if file_hint and Path(file_hint).name.lower() == "amortization.py":
+            return "amortization"
+
+        return self.default_submodel()
+
+    def build_causal_graph(
+        self,
+        submodel: Optional[str] = None,
+        target_hint: Optional[str] = None,
+        actor_hints: Optional[Sequence[str]] = None,
+        file_hint: Optional[str] = None,
+    ) -> CausalGraph:
+        """Compila un submodelo autocontenido de `loan_tax_engine` desde el AST vivo a `CausalGraph`."""
+        chosen = (submodel or "").strip() or self.infer_submodel(
+            target_id=target_hint,
+            actor_hints=actor_hints,
+            file_hint=file_hint,
+        )
+        if chosen not in self.SUBMODELS:
+            raise ValueError(
+                f"Unknown submodel '{chosen}' for '{self.REPO_ID}'. Available submodels: {list(self.SUBMODELS)}"
+            )
+
+        base_meta = {
+            "repo_id": self.REPO_ID,
+            "submodel": chosen,
+            "available_submodels": list(self.SUBMODELS),
+            "source_path": self.repo_path,
+        }
+
+        if chosen in ("tax_brackets", "tax_rates"):
+            fn_spec = self.extractor.functions.get("compute_progressive_tax")
+            rel_file = fn_spec.rel_file if fn_spec else "loan_tax_engine/tax_brackets.py"
+            lineno = fn_spec.lineno if fn_spec else 14
+            brackets = list(self.default_brackets)
+
+            y_nom = 35000.0
+            terms: List[str] = []
+            tot_nom = 0.0
+            marg_nom = 0.0
+            for lo, hi, rate in brackets:
+                if math.isfinite(hi):
+                    terms.append(f"{rate} * Max(0.0, Min(taxable_income, {hi}) - {lo})")
+                    if y_nom > lo:
+                        tot_nom += rate * (min(y_nom, hi) - lo)
+                        marg_nom = rate
+                else:
+                    terms.append(f"{rate} * Max(0.0, taxable_income - {lo})")
+                    if y_nom > lo:
+                        tot_nom += rate * (y_nom - lo)
+                        marg_nom = rate
+            tax_expr = " + ".join(terms)
+            net_nom = y_nom - tot_nom
+
+            if chosen == "tax_brackets":
+                nodes = [
+                    make_verified_node(
+                        "taxable_income",
+                        "control",
+                        rel_file,
+                        "taxable_income",
+                        lineno,
+                        current_value=y_nom,
+                        bounds={"min": 0.0, "max": 250000.0},
+                    ),
+                    make_verified_node(
+                        "tax_total",
+                        "state",
+                        rel_file,
+                        "compute_progressive_tax",
+                        38,
+                        current_value=tot_nom,
+                        symbolic_expr=tax_expr,
+                    ),
+                    make_verified_node(
+                        "net_income",
+                        "target",
+                        rel_file,
+                        "compute_progressive_tax",
+                        58,
+                        current_value=net_nom,
+                        symbolic_expr="taxable_income - tax_total",
+                    ),
+                ]
+                edges = [
+                    ("taxable_income", "tax_total"),
+                    ("taxable_income", "net_income"),
+                    ("tax_total", "net_income"),
+                ]
+                constraints = [
+                    Constraint(
+                        id="c_tax_conservation",
+                        type="hard",
+                        expression="tax_total + net_income == taxable_income",
+                        description="Gross taxable income decomposes exactly into tax_total + net_income.",
+                    ),
+                    Constraint(
+                        id="c_nonneg_tax",
+                        type="hard",
+                        expression="tax_total >= 0.0 and net_income >= 0.0",
+                        description="Progressive tax and post-tax net income remain non-negative.",
+                    ),
+                ]
+                return build_verified_causal_graph(
+                    system_id="loan_tax_engine_tax_brackets",
+                    nodes=nodes,
+                    edges=edges,
+                    constraints=constraints,
+                    metadata={"sense": "max", **base_meta},
+                )
+
+            # chosen == "tax_rates"
+            desc_brackets = sorted(brackets, key=lambda item: item[0], reverse=True)
+            pw_marg_parts = [f"({rate}, taxable_income > {lo})" for lo, _, rate in desc_brackets]
+            pw_marg_parts.append("(0.0, True)")
+            marg_expr = f"Piecewise({', '.join(pw_marg_parts)})"
+            eff_expr = "Piecewise((0.0, taxable_income <= 0.0), (tax_total / taxable_income, True))"
+            eff_nom = tot_nom / y_nom if y_nom > 0.0 else 0.0
+
+            nodes = [
+                make_verified_node(
+                    "taxable_income",
+                    "control",
+                    rel_file,
+                    "taxable_income",
+                    lineno,
+                    current_value=y_nom,
+                    bounds={"min": 1.0, "max": 250000.0},
+                ),
+                make_verified_node(
+                    "tax_total",
+                    "state",
+                    rel_file,
+                    "compute_progressive_tax",
+                    38,
+                    current_value=tot_nom,
+                    symbolic_expr=tax_expr,
+                ),
+                make_verified_node(
+                    "marginal_rate",
+                    "state",
+                    rel_file,
+                    "compute_progressive_tax",
+                    40,
+                    current_value=marg_nom,
+                    symbolic_expr=marg_expr,
+                ),
+                make_verified_node(
+                    "effective_rate",
+                    "target",
+                    rel_file,
+                    "compute_progressive_tax",
+                    57,
+                    current_value=eff_nom,
+                    symbolic_expr=eff_expr,
+                ),
+            ]
+            edges = [
+                ("taxable_income", "tax_total"),
+                ("taxable_income", "marginal_rate"),
+                ("taxable_income", "effective_rate"),
+                ("tax_total", "effective_rate"),
+            ]
+            constraints = [
+                Constraint(
+                    id="c_progressive_rate_order",
+                    type="hard",
+                    expression="0.0 <= effective_rate and effective_rate <= marginal_rate",
+                    description="Under non-decreasing marginal brackets, average effective rate never exceeds marginal rate.",
+                )
+            ]
+            return build_verified_causal_graph(
+                system_id="loan_tax_engine_tax_rates",
+                nodes=nodes,
+                edges=edges,
+                constraints=constraints,
+                metadata={"sense": "min", **base_meta},
+            )
+
+        # chosen == "amortization"
+        fn_spec = self.extractor.functions.get("compute_french_schedule")
+        rel_file = fn_spec.rel_file if fn_spec else "loan_tax_engine/amortization.py"
+        lineno = fn_spec.lineno if fn_spec else 7
+        freq_default = float((fn_spec.defaults.get("freq_per_year") if fn_spec else None) or 12.0)
+
+        top_eqs = self.extractor.extract_structural_equations(
+            "compute_french_schedule",
+            keep_symbols={"r": "periodic_rate"},
+        )
+        r_expr, r_line = top_eqs.get("periodic_rate", (sp.sympify("annual_rate / freq_per_year"), 35))
+
+        pos_pay_expr_str = "principal * (periodic_rate * (1.0 + periodic_rate)**periods) / ((1.0 + periodic_rate)**periods - 1.0)"
+        zero_pay_expr_str = "principal / periods"
+        if fn_spec is not None:
+            for stmt in fn_spec.ast_node.body:
+                if isinstance(stmt, ast.If) and stmt.orelse:
+                    try:
+                        c_if = ASTFunctionToSymPy({}, {}, self.extractor._helper_ast_map)
+                        c_if.env = {
+                            "principal": sp.Symbol("principal", real=True),
+                            "periods": sp.Symbol("periods", real=True),
+                            "r": sp.Symbol("periodic_rate", real=True),
+                        }
+                        for b_s in stmt.body:
+                            if (
+                                isinstance(b_s, ast.Assign)
+                                and len(b_s.targets) == 1
+                                and isinstance(b_s.targets[0], ast.Name)
+                                and b_s.targets[0].id == "payment"
+                            ):
+                                zero_pay_expr_str = str(c_if.eval_expr(b_s.value))
+                        c_el = ASTFunctionToSymPy({}, {}, self.extractor._helper_ast_map)
+                        c_el.env = {
+                            "principal": sp.Symbol("principal", real=True),
+                            "periods": sp.Symbol("periods", real=True),
+                            "r": sp.Symbol("periodic_rate", real=True),
+                        }
+                        for e_s in stmt.orelse:
+                            if isinstance(e_s, ast.Assign) and len(e_s.targets) == 1 and isinstance(e_s.targets[0], ast.Name):
+                                v_id = e_s.targets[0].id
+                                v_ex = c_el.eval_expr(e_s.value)
+                                if v_id == "payment":
+                                    pos_pay_expr_str = str(v_ex)
+                                else:
+                                    c_el.env[v_id] = v_ex
+                    except Exception:
+                        pass
+
+        pay_expr_str = f"Piecewise(({zero_pay_expr_str}, periodic_rate <= 1e-12), ({pos_pay_expr_str}, True))"
+
+        p_nom, rate_nom, n_nom, cap_pay_nom = 100000.0, 0.05, 120.0, 1500.0
+        r_nom = float(
+            r_expr.evalf(
+                subs={
+                    sp.Symbol("annual_rate", real=True): rate_nom,
+                    sp.Symbol("freq_per_year", real=True): freq_default,
+                }
+            )
+        )
+        pay_sym = sp.sympify(
+            pay_expr_str,
+            locals={
+                "principal": sp.Symbol("principal", real=True),
+                "periods": sp.Symbol("periods", real=True),
+                "periodic_rate": sp.Symbol("periodic_rate", real=True),
+                "Piecewise": sp.Piecewise,
+                "Abs": sp.Abs,
+            },
+        )
+        pay_nom = float(
+            pay_sym.evalf(
+                subs={
+                    sp.Symbol("principal", real=True): p_nom,
+                    sp.Symbol("periods", real=True): n_nom,
+                    sp.Symbol("periodic_rate", real=True): r_nom,
+                }
+            )
+        )
+        tot_paid_nom = pay_nom * n_nom
+        tot_int_nom = tot_paid_nom - p_nom
+
+        nodes = [
+            make_verified_node(
+                "annual_rate",
+                "exogenous",
+                rel_file,
+                "annual_rate",
+                lineno,
+                current_value=rate_nom,
+                bounds={"min": 0.0, "max": 0.25},
+            ),
+            make_verified_node(
+                "periods",
+                "exogenous",
+                rel_file,
+                "periods",
+                lineno,
+                current_value=n_nom,
+                bounds={"min": 12.0, "max": 360.0},
+                data_type="discrete",
+            ),
+            make_verified_node(
+                "freq_per_year",
+                "exogenous",
+                rel_file,
+                "freq_per_year",
+                lineno,
+                current_value=freq_default,
+                bounds={"min": 4.0, "max": 12.0},
+                data_type="discrete",
+            ),
+            make_verified_node(
+                "max_monthly_payment",
+                "exogenous",
+                rel_file,
+                "max_monthly_payment",
+                lineno,
+                current_value=cap_pay_nom,
+                bounds={"min": 500.0, "max": 50000.0},
+            ),
+            make_verified_node(
+                "principal",
+                "control",
+                rel_file,
+                "principal",
+                lineno,
+                current_value=p_nom,
+                bounds={"min": 1000.0, "max": 500000.0},
+            ),
+            make_verified_node(
+                "periodic_rate",
+                "state",
+                rel_file,
+                "compute_french_schedule",
+                r_line,
+                current_value=r_nom,
+                symbolic_expr=str(r_expr),
+            ),
+            make_verified_node(
+                "payment_per_period",
+                "state",
+                rel_file,
+                "compute_french_schedule",
+                56,
+                current_value=pay_nom,
+                symbolic_expr=pay_expr_str,
+            ),
+            make_verified_node(
+                "total_paid",
+                "state",
+                rel_file,
+                "compute_french_schedule",
+                85,
+                current_value=tot_paid_nom,
+                symbolic_expr="payment_per_period * periods",
+            ),
+            make_verified_node(
+                "total_principal",
+                "state",
+                rel_file,
+                "compute_french_schedule",
+                86,
+                current_value=p_nom,
+                symbolic_expr="principal",
+            ),
+            make_verified_node(
+                "total_interest",
+                "target",
+                rel_file,
+                "compute_french_schedule",
+                87,
+                current_value=tot_int_nom,
+                symbolic_expr="total_paid - total_principal",
+            ),
+        ]
+        edges = [
+            ("annual_rate", "periodic_rate"),
+            ("freq_per_year", "periodic_rate"),
+            ("principal", "payment_per_period"),
+            ("periodic_rate", "payment_per_period"),
+            ("periods", "payment_per_period"),
+            ("payment_per_period", "total_paid"),
+            ("periods", "total_paid"),
+            ("principal", "total_principal"),
+            ("total_paid", "total_interest"),
+            ("total_principal", "total_interest"),
+        ]
+        constraints = [
+            Constraint(
+                id="c_payment_cap",
+                type="hard",
+                expression="payment_per_period <= max_monthly_payment",
+                description="Periodic annuity payment must not exceed borrower payment ceiling.",
+            ),
+            Constraint(
+                id="c_positive_payment",
+                type="hard",
+                expression="payment_per_period >= 0.0",
+                description="Periodic French amortization payment is non-negative.",
+            ),
+        ]
+        return build_verified_causal_graph(
+            system_id="loan_tax_engine_amortization",
+            nodes=nodes,
+            edges=edges,
+            constraints=constraints,
+            metadata={"sense": "min", **base_meta},
         )

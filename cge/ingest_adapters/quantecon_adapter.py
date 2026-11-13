@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import networkx as nx
 import numpy as np
 import sympy as sp
 
-from ..schema import CausalGraph
+from ..schema import CausalGraph, Constraint
 from ..solver import solve_problem
 from .base import (
     AdapterResponse,
@@ -31,6 +32,7 @@ class QuantEconCausalAdapter:
     """Compila estáticamente `quantecon_cournot_solow` (Cournot-Nash y Solow-Swan) a IR ejecutable CGE."""
 
     REPO_ID = "quantecon_cournot_solow"
+    SUBMODELS: Tuple[str, ...] = ("solow", "cournot", "cournot_cartel")
 
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
@@ -1662,4 +1664,471 @@ class QuantEconCausalAdapter:
             parsed_output=None,
             confidence_claim="UNSUPPORTED_DOMAIN",
             raw_answer=f"Consulta '{q}' no soportada.",
+        )
+
+    def list_submodels(self) -> List[str]:
+        return list(self.SUBMODELS)
+
+    def default_submodel(self) -> str:
+        return "solow"
+
+    def infer_submodel(
+        self,
+        target_id: Optional[str] = None,
+        actor_hints: Optional[Sequence[str]] = None,
+        file_hint: Optional[str] = None,
+    ) -> str:
+        hints: Set[str] = set(actor_hints or [])
+        if target_id:
+            hints.add(target_id)
+
+        cournot_actors = {
+            "a",
+            "b",
+            "c1",
+            "c2",
+            "cap1",
+            "cap2",
+            "q1",
+            "q2",
+            "total_quantity",
+            "price",
+            "profit_1",
+            "profit_2",
+            "total_profit",
+        }
+        solow_actors = {
+            "s",
+            "alpha",
+            "n",
+            "g",
+            "delta",
+            "effective_depreciation",
+            "k_star",
+            "y_star",
+            "i_star",
+            "c_star",
+        }
+        if hints & cournot_actors and not (hints & solow_actors):
+            return "cournot"
+        if hints & solow_actors:
+            return "solow"
+
+        if file_hint:
+            fname = Path(file_hint).name.lower()
+            if fname == "cournot.py":
+                return "cournot"
+            if fname == "solow.py":
+                return "solow"
+
+        return self.default_submodel()
+
+    def build_causal_graph(
+        self,
+        submodel: Optional[str] = None,
+        target_hint: Optional[str] = None,
+        actor_hints: Optional[Sequence[str]] = None,
+        file_hint: Optional[str] = None,
+    ) -> CausalGraph:
+        """Compila un submodelo autocontenido de `quantecon_cournot_solow` desde el AST vivo a `CausalGraph`."""
+        chosen = (submodel or "").strip() or self.infer_submodel(
+            target_id=target_hint,
+            actor_hints=actor_hints,
+            file_hint=file_hint,
+        )
+        if chosen not in self.SUBMODELS:
+            raise ValueError(
+                f"Unknown submodel '{chosen}' for '{self.REPO_ID}'. Available submodels: {list(self.SUBMODELS)}"
+            )
+
+        base_meta = {
+            "repo_id": self.REPO_ID,
+            "submodel": chosen,
+            "available_submodels": list(self.SUBMODELS),
+            "source_path": self.repo_path,
+        }
+
+        if chosen == "solow":
+            ss_fn = self.extractor.functions.get("compute_steady_state")
+            rel_file = ss_fn.rel_file if ss_fn else "quantecon_cournot_solow/solow.py"
+            lineno = ss_fn.lineno if ss_fn else 8
+            eqs = self.extractor.extract_structural_equations(
+                "compute_steady_state",
+                keep_symbols={
+                    "effective_deprec": "effective_depreciation",
+                    "k_star": "k_star",
+                    "y_star": "y_star",
+                    "i_star": "i_star",
+                    "c_star": "c_star",
+                },
+            )
+            ed_expr, ed_line = eqs.get("effective_depreciation", (sp.sympify("n + g + delta"), 44))
+            k_expr, k_line = eqs.get(
+                "k_star", (sp.sympify("(s / effective_depreciation)**(1.0 / (1.0 - alpha))"), 49)
+            )
+            y_expr, y_line = eqs.get("y_star", (sp.sympify("k_star**alpha"), 50))
+            i_expr, i_line = eqs.get("i_star", (sp.sympify("s * y_star"), 51))
+            c_expr, c_line = eqs.get("c_star", (sp.sympify("y_star - i_star"), 52))
+
+            alpha_nom, n_nom, g_nom, delta_nom, s_nom = 0.33, 0.01, 0.02, 0.05, 0.25
+            subs_nom = {
+                sp.Symbol("alpha", real=True): alpha_nom,
+                sp.Symbol("n", real=True): n_nom,
+                sp.Symbol("g", real=True): g_nom,
+                sp.Symbol("delta", real=True): delta_nom,
+                sp.Symbol("s", real=True): s_nom,
+            }
+            ed_val = float(ed_expr.evalf(subs=subs_nom))
+            subs_nom[sp.Symbol("effective_depreciation", real=True)] = ed_val
+            k_val = float(k_expr.evalf(subs=subs_nom))
+            subs_nom[sp.Symbol("k_star", real=True)] = k_val
+            y_val = float(y_expr.evalf(subs=subs_nom))
+            subs_nom[sp.Symbol("y_star", real=True)] = y_val
+            i_val = float(i_expr.evalf(subs=subs_nom))
+            subs_nom[sp.Symbol("i_star", real=True)] = i_val
+            c_val = float(c_expr.evalf(subs=subs_nom))
+
+            nodes = [
+                make_verified_node(
+                    "alpha",
+                    "exogenous",
+                    rel_file,
+                    "alpha",
+                    lineno,
+                    current_value=alpha_nom,
+                    bounds={"min": 0.05, "max": 0.90},
+                ),
+                make_verified_node(
+                    "n",
+                    "exogenous",
+                    rel_file,
+                    "n",
+                    lineno,
+                    current_value=n_nom,
+                    bounds={"min": 0.0, "max": 0.20},
+                ),
+                make_verified_node(
+                    "g",
+                    "exogenous",
+                    rel_file,
+                    "g",
+                    lineno,
+                    current_value=g_nom,
+                    bounds={"min": 0.0, "max": 0.20},
+                ),
+                make_verified_node(
+                    "delta",
+                    "exogenous",
+                    rel_file,
+                    "delta",
+                    lineno,
+                    current_value=delta_nom,
+                    bounds={"min": 0.005, "max": 0.50},
+                ),
+                make_verified_node(
+                    "s",
+                    "control",
+                    rel_file,
+                    "s",
+                    lineno,
+                    current_value=s_nom,
+                    bounds={"min": 0.01, "max": 0.99},
+                ),
+                make_verified_node(
+                    "effective_depreciation",
+                    "state",
+                    rel_file,
+                    "compute_steady_state",
+                    ed_line,
+                    current_value=ed_val,
+                    symbolic_expr=str(ed_expr),
+                ),
+                make_verified_node(
+                    "k_star",
+                    "state",
+                    rel_file,
+                    "compute_steady_state",
+                    k_line,
+                    current_value=k_val,
+                    symbolic_expr=str(k_expr),
+                ),
+                make_verified_node(
+                    "y_star",
+                    "state",
+                    rel_file,
+                    "compute_steady_state",
+                    y_line,
+                    current_value=y_val,
+                    symbolic_expr=str(y_expr),
+                ),
+                make_verified_node(
+                    "i_star",
+                    "state",
+                    rel_file,
+                    "compute_steady_state",
+                    i_line,
+                    current_value=i_val,
+                    symbolic_expr=str(i_expr),
+                ),
+                make_verified_node(
+                    "c_star",
+                    "target",
+                    rel_file,
+                    "compute_steady_state",
+                    c_line,
+                    current_value=c_val,
+                    symbolic_expr=str(c_expr),
+                ),
+            ]
+            node_ids = {n.id for n in nodes}
+            edges: List[Tuple[str, str]] = []
+            for dst_id, expr_obj in (
+                ("effective_depreciation", ed_expr),
+                ("k_star", k_expr),
+                ("y_star", y_expr),
+                ("i_star", i_expr),
+                ("c_star", c_expr),
+            ):
+                for sym in sorted(expr_obj.free_symbols, key=lambda s: s.name):
+                    if sym.name in node_ids and sym.name != dst_id:
+                        edges.append((sym.name, dst_id))
+
+            constraints = [
+                Constraint(
+                    id="c_national_accounts",
+                    type="hard",
+                    expression="c_star >= 0.0 and i_star >= 0.0",
+                    description="Steady-state consumption and investment are non-negative.",
+                )
+            ]
+            return build_verified_causal_graph(
+                system_id="quantecon_solow_steady_state",
+                nodes=nodes,
+                edges=edges,
+                constraints=constraints,
+                metadata={"sense": "max", **base_meta},
+            )
+
+        # chosen in ("cournot", "cournot_cartel")
+        cn_fn = self.extractor.functions.get("solve_cournot_nash")
+        rel_file = cn_fn.rel_file if cn_fn else "quantecon_cournot_solow/cournot.py"
+        lineno = cn_fn.lineno if cn_fn else 7
+
+        cn_eqs = self.extractor.extract_structural_equations(
+            "solve_cournot_nash",
+            keep_symbols={"market_price": "price"},
+            seed_env={"total_q": sp.Symbol("total_quantity", real=True)},
+        )
+        price_expr, price_line = cn_eqs.get("price", (sp.sympify("Max(0.0, a - b * total_quantity)"), 75))
+
+        a_nom, b_nom, c1_nom, c2_nom, cap1_nom, cap2_nom = 100.0, 1.0, 10.0, 10.0, 100.0, 100.0
+        q1_nom, q2_nom = 30.0, 30.0
+        tot_q_nom = q1_nom + q2_nom
+        p_nom = float(
+            price_expr.evalf(
+                subs={
+                    sp.Symbol("a", real=True): a_nom,
+                    sp.Symbol("b", real=True): b_nom,
+                    sp.Symbol("total_quantity", real=True): tot_q_nom,
+                }
+            )
+        )
+        pi1_nom = (p_nom - c1_nom) * q1_nom
+        pi2_nom = (p_nom - c2_nom) * q2_nom
+        tot_pi_nom = pi1_nom + pi2_nom
+
+        nodes = [
+            make_verified_node(
+                "a",
+                "exogenous",
+                rel_file,
+                "a",
+                lineno,
+                current_value=a_nom,
+                bounds={"min": 10.0, "max": 1000.0},
+            ),
+            make_verified_node(
+                "b",
+                "exogenous",
+                rel_file,
+                "b",
+                lineno,
+                current_value=b_nom,
+                bounds={"min": 0.05, "max": 50.0},
+            ),
+            make_verified_node(
+                "c1",
+                "exogenous",
+                rel_file,
+                "c1",
+                lineno,
+                current_value=c1_nom,
+                bounds={"min": 0.0, "max": 500.0},
+            ),
+            make_verified_node(
+                "c2",
+                "exogenous",
+                rel_file,
+                "c2",
+                lineno,
+                current_value=c2_nom,
+                bounds={"min": 0.0, "max": 500.0},
+            ),
+            make_verified_node(
+                "cap1",
+                "exogenous",
+                rel_file,
+                "cap1",
+                lineno,
+                current_value=cap1_nom,
+                bounds={"min": 1.0, "max": 1000.0},
+            ),
+            make_verified_node(
+                "cap2",
+                "exogenous",
+                rel_file,
+                "cap2",
+                lineno,
+                current_value=cap2_nom,
+                bounds={"min": 1.0, "max": 1000.0},
+            ),
+        ]
+        edges = []
+
+        if chosen == "cournot":
+            q1_expr_str = (
+                "Min(cap1, Piecewise("
+                "(0.0, a - 2.0 * c1 + c2 < 0.0), "
+                "(Max(0.0, (a - c1) / (2.0 * b)), a - 2.0 * c2 + c1 < 0.0), "
+                "(Max(0.0, (a - 2.0 * c1 + c2) / (3.0 * b)), True)))"
+            )
+            q2_expr_str = (
+                "Min(cap2, Piecewise("
+                "(0.0, a - 2.0 * c2 + c1 < 0.0), "
+                "(Max(0.0, (a - c2) / (2.0 * b)), a - 2.0 * c1 + c2 < 0.0), "
+                "(Max(0.0, (a - 2.0 * c2 + c1) / (3.0 * b)), True)))"
+            )
+            nodes.extend([
+                make_verified_node(
+                    "q1",
+                    "state",
+                    rel_file,
+                    "solve_cournot_nash",
+                    57,
+                    current_value=q1_nom,
+                    symbolic_expr=q1_expr_str,
+                ),
+                make_verified_node(
+                    "q2",
+                    "state",
+                    rel_file,
+                    "solve_cournot_nash",
+                    57,
+                    current_value=q2_nom,
+                    symbolic_expr=q2_expr_str,
+                ),
+            ])
+            for src_id in ("a", "b", "c1", "c2", "cap1"):
+                edges.append((src_id, "q1"))
+            for src_id in ("a", "b", "c1", "c2", "cap2"):
+                edges.append((src_id, "q2"))
+        else:
+            nodes.extend([
+                make_verified_node(
+                    "q1",
+                    "control",
+                    rel_file,
+                    "q1",
+                    lineno,
+                    current_value=q1_nom,
+                    bounds={"min": 0.0, "max": 100.0},
+                ),
+                make_verified_node(
+                    "q2",
+                    "control",
+                    rel_file,
+                    "q2",
+                    lineno,
+                    current_value=q2_nom,
+                    bounds={"min": 0.0, "max": 100.0},
+                ),
+            ])
+
+        nodes.extend([
+            make_verified_node(
+                "total_quantity",
+                "state",
+                rel_file,
+                "solve_cournot_nash",
+                74,
+                current_value=tot_q_nom,
+                symbolic_expr="q1 + q2",
+            ),
+            make_verified_node(
+                "price",
+                "state",
+                rel_file,
+                "solve_cournot_nash",
+                price_line,
+                current_value=p_nom,
+                symbolic_expr=str(price_expr),
+            ),
+            make_verified_node(
+                "profit_1",
+                "state",
+                rel_file,
+                "solve_cournot_nash",
+                76,
+                current_value=pi1_nom,
+                symbolic_expr="(price - c1) * q1",
+            ),
+            make_verified_node(
+                "profit_2",
+                "state",
+                rel_file,
+                "solve_cournot_nash",
+                76,
+                current_value=pi2_nom,
+                symbolic_expr="(price - c2) * q2",
+            ),
+            make_verified_node(
+                "total_profit",
+                "target",
+                rel_file,
+                "solve_cournot_nash",
+                76,
+                current_value=tot_pi_nom,
+                symbolic_expr="profit_1 + profit_2",
+            ),
+        ])
+        edges.extend([
+            ("q1", "total_quantity"),
+            ("q2", "total_quantity"),
+            ("a", "price"),
+            ("b", "price"),
+            ("total_quantity", "price"),
+            ("price", "profit_1"),
+            ("c1", "profit_1"),
+            ("q1", "profit_1"),
+            ("price", "profit_2"),
+            ("c2", "profit_2"),
+            ("q2", "profit_2"),
+            ("profit_1", "total_profit"),
+            ("profit_2", "total_profit"),
+        ])
+        constraints = [
+            Constraint(
+                id="c_market_clearing",
+                type="hard",
+                expression="price >= 0.0 and q1 <= cap1 and q2 <= cap2",
+                description="Aggregate duopoly supply clears inverse demand within firm capacity limits.",
+            )
+        ]
+        sys_id = "quantecon_cournot_nash" if chosen == "cournot" else "quantecon_cournot_cartel"
+        return build_verified_causal_graph(
+            system_id=sys_id,
+            nodes=nodes,
+            edges=edges,
+            constraints=constraints,
+            metadata={"sense": "max", **base_meta},
         )
