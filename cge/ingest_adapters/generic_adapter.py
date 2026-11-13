@@ -440,6 +440,31 @@ class GenericPackageAdapter:
     def _has_value_return(fn_node: ast.FunctionDef) -> bool:
         return any(isinstance(n, ast.Return) and n.value is not None for n in ast.walk(fn_node))
 
+    def _pkg_rel_file(self, rel_file: str) -> str:
+        """Normaliza `rel_file` respecto a `self.repo_dir` evitando duplicar el nombre del paquete."""
+        prefix = f"{self.repo_dir.name}/"
+        norm = rel_file.replace("\\", "/")
+        return norm[len(prefix):] if norm.startswith(prefix) else norm
+
+    @staticmethod
+    def _extract_return_dict_key_lines(stmts: Sequence[ast.stmt]) -> Dict[str, int]:
+        """Mapea claves literales de `return {...}` a su línea exacta en el AST."""
+        key_lines: Dict[str, int] = {}
+        for s in stmts:
+            for node in ast.walk(s):
+                if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+                    for k_node, v_node in zip(node.value.keys, node.value.values, strict=False):
+                        if isinstance(k_node, ast.Constant) and isinstance(k_node.value, str):
+                            k_str = str(k_node.value).strip()
+                            if k_str:
+                                line_v = getattr(
+                                    k_node,
+                                    "lineno",
+                                    getattr(v_node, "lineno", getattr(node, "lineno", 1)),
+                                )
+                                key_lines[k_str] = int(line_v)
+        return key_lines
+
     def _discover_and_validate_submodels(self) -> None:
         public_fns: Dict[str, ExtractedFunctionSpec] = {
             name: spec
@@ -644,6 +669,11 @@ class GenericPackageAdapter:
         if data_type == "boolean":
             lb = 0.0 if lb is None else max(0.0, lb)
             ub = 1.0 if ub is None else min(1.0, ub)
+        elif data_type == "discrete":
+            if lb is not None:
+                lb = float(math.ceil(lb - 1e-12))
+            if ub is not None:
+                ub = float(math.floor(ub + 1e-12))
         return {"min": lb, "max": ub}
 
     @staticmethod
@@ -707,6 +737,15 @@ class GenericPackageAdapter:
         has_explicit_controls = bool(sidecar_sub and len(sidecar_sub.controls) > 0)
         ast_bounds_map = self._collect_transitive_helper_bounds(fn_spec)
         param_set = set(fn_spec.params)
+        pkg_rel = self._pkg_rel_file(fn_spec.rel_file)
+        arg_line_map = {
+            a.arg: int(getattr(a, "lineno", fn_spec.lineno))
+            for a in (
+                list(getattr(fn_spec.ast_node.args, "posonlyargs", []))
+                + list(fn_spec.ast_node.args.args)
+                + list(fn_spec.ast_node.args.kwonlyargs)
+            )
+        }
 
         # 1. Construir nodos hoja (parámetros de entrada)
         nodes_list = []
@@ -754,9 +793,9 @@ class GenericPackageAdapter:
                 make_verified_node(
                     node_id=p_name,
                     category=cat,
-                    rel_file=fn_spec.rel_file,
+                    rel_file=pkg_rel,
                     entity=p_name,
-                    lineno=fn_spec.lineno,
+                    lineno=arg_line_map.get(p_name, fn_spec.lineno),
                     current_value=nom_val,
                     bounds=merged_b,
                     data_type=dt,
@@ -957,6 +996,7 @@ class GenericPackageAdapter:
 
         ret_val = compiler.compile_statements(remaining_stmts, dict(compiler.env)) if remaining_stmts else None
         ret_lineno = getattr(remaining_stmts[-1], "lineno", fn_spec.end_lineno) if remaining_stmts else fn_spec.end_lineno
+        ret_key_lines = self._extract_return_dict_key_lines(clean_body)
 
         # Determinar mapa ordenado de ecuaciones calculadas (estados + salidas)
         computed_exprs: Dict[str, Tuple[sp.Expr, int]] = dict(ssa_exprs)
@@ -977,7 +1017,7 @@ class GenericPackageAdapter:
                 if k_name in computed_exprs and v_expr == sp.Symbol(k_name, real=True):
                     dict_keys_added.append(k_name)
                     continue
-                computed_exprs[k_name] = (v_expr, ret_lineno)
+                computed_exprs[k_name] = (v_expr, ret_key_lines.get(k_name, ret_lineno))
                 dict_keys_added.append(k_name)
             if not dict_keys_added:
                 raise ValueError(f"Returned dictionary in '{fn_spec.name}' contained zero numeric/symbolic metrics.")
@@ -1032,6 +1072,7 @@ class GenericPackageAdapter:
             except Exception:
                 eval_state[cid] = 0.0
 
+        pkg_rel = self._pkg_rel_file(fn_spec.rel_file)
         nodes_out = []
         for cid, (c_expr, c_line) in computed_exprs.items():
             cat_c = "target" if cid == chosen_target else "state"
@@ -1039,7 +1080,7 @@ class GenericPackageAdapter:
                 make_verified_node(
                     node_id=cid,
                     category=cat_c,
-                    rel_file=fn_spec.rel_file,
+                    rel_file=pkg_rel,
                     entity=fn_spec.name,
                     lineno=c_line,
                     current_value=eval_state.get(cid, 0.0),
@@ -1070,6 +1111,9 @@ class GenericPackageAdapter:
         loaded_in_body = self._collect_loaded_names(clean_body)
         active_params = [p for p in ordered_params if p in loaded_in_body]
 
+        pkg_rel = self._pkg_rel_file(fn_spec.rel_file)
+        ret_key_lines = self._extract_return_dict_key_lines(clean_body)
+
         # Detectar variables locales muertas top-level (asignadas y jamás leídas ni retornadas)
         dead_local_nodes = []
         edges_out: List[Tuple[str, str]] = []
@@ -1095,7 +1139,7 @@ class GenericPackageAdapter:
                         make_verified_node(
                             node_id=v_local,
                             category="state",
-                            rel_file=fn_spec.rel_file,
+                            rel_file=pkg_rel,
                             entity=fn_spec.name,
                             lineno=getattr(stmt, "lineno", fn_spec.lineno),
                             current_value=0.0,
@@ -1129,9 +1173,9 @@ class GenericPackageAdapter:
                     make_verified_node(
                         node_id=m_name,
                         category=cat_m,
-                        rel_file=fn_spec.rel_file,
+                        rel_file=pkg_rel,
                         entity=fn_spec.name,
-                        lineno=fn_spec.end_lineno,
+                        lineno=ret_key_lines.get(m_name, fn_spec.end_lineno),
                         current_value=m_nom,
                         symbolic_expr=None,
                     )
@@ -1159,7 +1203,7 @@ class GenericPackageAdapter:
                 make_verified_node(
                     node_id=out_id,
                     category="target",
-                    rel_file=fn_spec.rel_file,
+                    rel_file=pkg_rel,
                     entity=fn_spec.name,
                     lineno=fn_spec.end_lineno,
                     current_value=val_f,

@@ -532,6 +532,15 @@ class ActorDBOracle:
                         "zero_hallucination_verified": True,
                     }
 
+            if (
+                not os.path.exists(src_clean)
+                and not os.path.isabs(src_clean)
+                and not _looks_like_inline_code(src_clean)
+            ):
+                ws_cand = self._repo_engine.workspace_root / src_clean
+                if ws_cand.exists():
+                    src_clean = str(ws_cand.resolve())
+
             if os.path.isdir(src_clean):
                 sig = _compute_fs_signature(src_clean)
                 with self._lock:
@@ -755,6 +764,113 @@ class ActorDBOracle:
                 state[nid] = float(fn(*args))
         return state
 
+    @staticmethod
+    def _select_active_branch(expr_in: sp.Expr, subs_nom: Dict[Any, float]) -> sp.Expr:
+        """Colapsa Min/Max/Abs/Piecewise a su rama activa en el estado nominal."""
+        cur_e = expr_in
+        for _ in range(12):
+            replaced_any = False
+            for sub in list(sp.postorder_traversal(cur_e)):
+                if isinstance(sub, sp.Min) and len(sub.args) >= 2:
+                    chosen_m = min(sub.args, key=lambda a: float(a.evalf(subs=subs_nom)))
+                    cur_e = cur_e.xreplace({sub: chosen_m})
+                    replaced_any = True
+                    break
+                elif isinstance(sub, sp.Max) and len(sub.args) >= 2:
+                    chosen_m = max(sub.args, key=lambda a: float(a.evalf(subs=subs_nom)))
+                    cur_e = cur_e.xreplace({sub: chosen_m})
+                    replaced_any = True
+                    break
+                elif isinstance(sub, sp.Abs) and len(sub.args) == 1:
+                    v_a = float(sub.args[0].evalf(subs=subs_nom))
+                    cur_e = cur_e.xreplace({sub: (sub.args[0] if v_a >= 0.0 else -sub.args[0])})
+                    replaced_any = True
+                    break
+                elif isinstance(sub, sp.Piecewise):
+                    chosen = sub.args[-1][0]
+                    for val_b, cond_b in sub.args:
+                        if cond_b is sp.true or cond_b is True:
+                            chosen = val_b
+                            break
+                        c_eval = cond_b.xreplace(subs_nom)
+                        if bool(c_eval) is True:
+                            chosen = val_b
+                            break
+                    cur_e = cur_e.xreplace({sub: chosen})
+                    replaced_any = True
+                    break
+            if not replaced_any:
+                break
+        return cur_e
+
+    @classmethod
+    def _populate_local_edge_sensitivities(
+        cls,
+        graph: CausalGraph,
+        syms: Dict[str, sp.Symbol],
+        mechanisms: Dict[str, sp.Expr],
+        nominal_state: Dict[str, float],
+        compiled_fns: Optional[Dict[str, Tuple[List[str], Callable[..., Any]]]] = None,
+    ) -> Dict[str, Any]:
+        """Rellena derivadas parciales locales ∂v/∂u en las aristas del diccionario de grafo cuando valen None."""
+        r_dict = graph.to_dict()
+        edges = r_dict.get("edges", [])
+        if not any(
+            e.get("sensitivity_weight") is None and e.get("type", "exact_code") != "empirical_data"
+            for e in edges
+        ):
+            return r_dict
+
+        subs_nom = {syms[k]: float(nominal_state[k]) for k in nominal_state if k in syms}
+        for e in edges:
+            if e.get("sensitivity_weight") is not None or e.get("type", "exact_code") == "empirical_data":
+                continue
+            u = e.get("source")
+            v = e.get("target")
+            if not u or not v:
+                continue
+
+            local_w: Optional[float] = None
+            if v in mechanisms and u in syms:
+                try:
+                    act_e = cls._select_active_branch(mechanisms[v], subs_nom)
+                    deriv_e = sp.diff(act_e, syms[u])
+                    val_f = float(deriv_e.evalf(subs=subs_nom))
+                    if math.isfinite(val_f):
+                        local_w = round(val_f, 8)
+                except Exception:
+                    local_w = None
+            elif compiled_fns and v in compiled_fns:
+                arg_names, py_fn = compiled_fns[v]
+                if u in arg_names:
+                    u_idx = arg_names.index(u)
+                    base_args = [float(nominal_state.get(a, 0.0)) for a in arg_names]
+                    x0 = base_args[u_idx]
+                    u_node = graph.nodes.get(u)
+                    is_disc = bool(u_node and u_node.data_type == "discrete")
+                    eps = 1.0 if is_disc else max(1e-6, 1e-5 * abs(x0))
+                    try:
+                        args_hi = list(base_args)
+                        args_lo = list(base_args)
+                        args_hi[u_idx] = x0 + eps
+                        args_lo[u_idx] = x0 - eps
+                        val_f = (float(py_fn(*args_hi)) - float(py_fn(*args_lo))) / (2.0 * eps)
+                        if math.isfinite(val_f):
+                            local_w = round(val_f, 8)
+                    except Exception:
+                        try:
+                            args_hi = list(base_args)
+                            args_hi[u_idx] = x0 + eps
+                            val_f = (float(py_fn(*args_hi)) - float(py_fn(*base_args))) / eps
+                            if math.isfinite(val_f):
+                                local_w = round(val_f, 8)
+                        except Exception:
+                            local_w = None
+
+            if local_w is not None:
+                e["sensitivity_weight"] = local_w
+        return r_dict
+
     @classmethod
     def _symbolic_and_numeric_derivative(
         cls,
@@ -804,43 +920,6 @@ class ActorDBOracle:
             expanded_active: Dict[str, sp.Expr] = {}
             subs_nom = {syms[k]: nominal_state[k] for k in nominal_state if k in syms}
 
-            def _select_active_branch(expr_in: sp.Expr) -> sp.Expr:
-                cur_e = expr_in
-                for _ in range(12):
-                    replaced_any = False
-                    for sub in list(sp.postorder_traversal(cur_e)):
-                        if isinstance(sub, sp.Min) and len(sub.args) >= 2:
-                            chosen_m = min(sub.args, key=lambda a: float(a.evalf(subs=subs_nom)))
-                            cur_e = cur_e.xreplace({sub: chosen_m})
-                            replaced_any = True
-                            break
-                        elif isinstance(sub, sp.Max) and len(sub.args) >= 2:
-                            chosen_m = max(sub.args, key=lambda a: float(a.evalf(subs=subs_nom)))
-                            cur_e = cur_e.xreplace({sub: chosen_m})
-                            replaced_any = True
-                            break
-                        elif isinstance(sub, sp.Abs) and len(sub.args) == 1:
-                            v_a = float(sub.args[0].evalf(subs=subs_nom))
-                            cur_e = cur_e.xreplace({sub: (sub.args[0] if v_a >= 0.0 else -sub.args[0])})
-                            replaced_any = True
-                            break
-                        elif isinstance(sub, sp.Piecewise):
-                            chosen = sub.args[-1][0]
-                            for val_b, cond_b in sub.args:
-                                if cond_b is sp.true or cond_b is True:
-                                    chosen = val_b
-                                    break
-                                c_eval = cond_b.xreplace(subs_nom)
-                                if bool(c_eval) is True:
-                                    chosen = val_b
-                                    break
-                            cur_e = cur_e.xreplace({sub: chosen})
-                            replaced_any = True
-                            break
-                    if not replaced_any:
-                        break
-                return cur_e
-
             for nid in topo:
                 if nid == source or nid not in mechanisms:
                     expanded[nid] = syms[nid]
@@ -850,7 +929,7 @@ class ActorDBOracle:
                     s_map = {syms[k]: expanded[k] for k in expanded if k in syms and k != nid}
                     expanded[nid] = raw_e.xreplace(s_map)
 
-                    act_e = _select_active_branch(raw_e)
+                    act_e = cls._select_active_branch(raw_e, subs_nom)
                     s_act_map = {syms[k]: expanded_active[k] for k in expanded_active if k in syms and k != nid}
                     expanded_active[nid] = act_e.xreplace(s_act_map)
 
@@ -1081,7 +1160,14 @@ class ActorDBOracle:
                 "message": f"Nominal forward evaluation hit mathematical singularity: {exc}",
                 "zero_hallucination_verified": True,
             })
-        router = Layer1Router(graph.to_dict())
+        router_dict = self._populate_local_edge_sensitivities(
+            graph=graph,
+            syms=syms,
+            mechanisms=mechanisms,
+            nominal_state=nominal_state,
+            compiled_fns=compiled_fns,
+        )
+        router = Layer1Router(router_dict)
         adjoints_fallback = router.compute_reverse_mode_ad_adjoints(resolved_target)
 
         ancestors_set = nx.ancestors(dag, resolved_target) if dag.has_node(resolved_target) else set()

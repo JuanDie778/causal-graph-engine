@@ -1,0 +1,24 @@
+version: "1.0"
+system_id: "saas_governed_b2b"
+default_submodel: "evaluate_governed_contract"
+
+submodels:
+  evaluate_governed_contract:
+    entrypoint: "pricing.py:evaluate_governed_contract"
+    target: "net_operating_margin"
+    sense: "max"
+    controls:
+      seat_price:
+        bounds: [25.0, 120.0]
+      annual_discount:
+        bounds: [0.0, 0.30]
+    exogenous:
+      seats:
+        bounds: [10, 500]
+      sla_reserve_rate:
+        bounds: [0.0, 0.15]
+    constraints:
+      c_margin_floor:
+        type: "hard"
+        expression: "net_operating_margin >= 600.0"
+        description: "Piso normativo mínimo de margen operativo neto por contrato"

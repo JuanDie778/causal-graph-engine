@@ -108,7 +108,10 @@ on:
     paths:
       - "**/*.py"
       - "**/*.json"
+      - "**/*.yaml"
+      - "**/*.yml"
       - ".github/workflows/causal-diff.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -142,6 +145,7 @@ jobs:
           fetch-depth: 0
 
       - name: Ensure base branch remote ref exists
+        if: github.event_name == 'pull_request' && github.base_ref != ''
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
@@ -151,18 +155,21 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install ActorDB / CGE dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install numpy scipy sympy networkx pandas jsonschema pyyaml mcp
+          fi
 
       - name: Execute Causal Diff (JSON Oracle + Markdown Report)
         id: run_diff
         continue-on-error: true
         env:
-          BASE_REF: "origin/${{ github.base_ref }}"
+          BASE_REF: "${{ github.base_ref != '' && format('origin/{0}', github.base_ref) || 'HEAD~1' }}"
           SUBPATH_ARG: ${{ matrix.target.subpath }}
           ENTRYPOINT_ARG: ${{ matrix.target.entrypoint }}
         run: |
@@ -279,7 +286,7 @@ jobs:
           }
 
           critical_items = [
-              item for sec in ("invariant_regressions", "policy_shifts", "dead_nodes_added")
+              item for sec in ("invariant_regressions", "diagnostics")
               for item in report.get(sec, [])
               if item.get("severity") == "critical"
           ]

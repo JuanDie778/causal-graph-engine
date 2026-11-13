@@ -2297,6 +2297,7 @@ def _compute_leaf_bounds(
     bounds_out: Dict[str, Interval] = {}
     int_domains: Set[str] = set()
     overrides = domain_bounds or {}
+    unclassified_set: Set[str] = set((graph.metadata or {}).get("unclassified_leaves") or [])
 
     for vid in leaf_ids:
         node = graph.nodes[vid]
@@ -2320,7 +2321,20 @@ def _compute_leaf_bounds(
             )
         elif node.category == "exogenous":
             if b_min is not None and b_max is not None:
-                bounds_out[vid] = (float(b_min), float(b_max))
+                lo = float(b_min)
+                hi = float(b_max)
+                if vid in int_domains:
+                    lo = float(math.ceil(lo - 1e-12))
+                    hi = float(math.floor(hi + 1e-12))
+                bounds_out[vid] = (min(lo, hi), max(lo, hi))
+            elif vid in unclassified_set and (b_min is not None or b_max is not None):
+                span = max(10.0, abs(cur) * 2.0)
+                lo = float(b_min) if b_min is not None else (0.0 if cur >= 0.0 else cur - span)
+                hi = float(b_max) if b_max is not None else max(lo, cur + span)
+                if vid in int_domains:
+                    lo = float(math.ceil(lo - 1e-12))
+                    hi = float(math.floor(hi + 1e-12))
+                bounds_out[vid] = (min(lo, hi), max(lo, hi))
             elif isinstance(node.distribution, dict) and "std" in node.distribution:
                 mean_v = float(node.distribution.get("mean", cur))
                 std_v = abs(float(node.distribution.get("std", 0.0)))

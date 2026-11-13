@@ -71,6 +71,19 @@ class RepositoryCausalEngine:
     def clear_cache(self) -> None:
         self._adapter_cache.clear()
 
+    def _resolve_existing_path(self, raw_path: str) -> Optional[Path]:
+        """Resuelve una ruta existente absoluta, relativa al `cwd` o relativa a `self.workspace_root`."""
+        s = (raw_path or "").strip()
+        if not s:
+            return None
+        if os.path.exists(s):
+            return Path(s).resolve()
+        if not os.path.isabs(s):
+            cand = self.workspace_root / s
+            if cand.exists():
+                return cand.resolve()
+        return None
+
     def detect_repo_id_for_dir(self, dir_path: Path) -> Optional[str]:
         """Detecta si un directorio corresponde a un repositorio soportado por nombre o firma de módulos."""
         if not dir_path.exists() or not dir_path.is_dir():
@@ -209,14 +222,18 @@ class RepositoryCausalEngine:
         base_str = body
         explicit_submodel: Optional[str] = None
 
-        if body not in self.ADAPTER_REGISTRY and not os.path.exists(body) and ":" in body:
+        if body not in self.ADAPTER_REGISTRY and self._resolve_existing_path(body) is None and ":" in body:
             left, right = body.rsplit(":", 1)
             left_clean = left.strip()
             right_clean = right.strip()
             if (
                 len(left_clean) >= 2
                 and bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", right_clean))
-                and (left_clean in self.ADAPTER_REGISTRY or os.path.exists(left_clean) or has_scheme)
+                and (
+                    left_clean in self.ADAPTER_REGISTRY
+                    or self._resolve_existing_path(left_clean) is not None
+                    or has_scheme
+                )
             ):
                 base_str = left_clean
                 explicit_submodel = right_clean
@@ -237,8 +254,9 @@ class RepositoryCausalEngine:
                 "fs_signature": _compute_repo_fs_signature(repo_dir),
             }
 
-        if os.path.isdir(base_str):
-            dir_p = Path(base_str).resolve()
+        resolved_fs = self._resolve_existing_path(base_str)
+        if resolved_fs is not None and resolved_fs.is_dir():
+            dir_p = resolved_fs
             if not has_generic_scheme:
                 det_id = self.detect_repo_id_for_dir(dir_p)
                 if det_id is not None:
@@ -271,8 +289,8 @@ class RepositoryCausalEngine:
                 }
             return None
 
-        if os.path.isfile(base_str) and base_str.lower().endswith(".py"):
-            file_p = Path(base_str).resolve()
+        if resolved_fs is not None and resolved_fs.is_file() and resolved_fs.suffix.lower() == ".py":
+            file_p = resolved_fs
             if not has_generic_scheme:
                 det_id = self.detect_repo_id_for_dir(file_p.parent)
                 if det_id is not None:

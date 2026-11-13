@@ -13,6 +13,7 @@ import anyio
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 import pytest
+import yaml
 
 from cge.diff import CausalDiffEngine, DiffVerdict, diff_git_revisions, diff_sources
 from cge.ingest_adapters import (
@@ -624,4 +625,220 @@ class TestMCPStdioWireIntegrationOnGenericPackage:
                 assert prv["seal"] == "PROVEN"
 
         anyio.run(_wire_scenario)
+
+
+class TestFourLiveAuditRefinements:
+    def test_refinement_1_clean_source_references_and_integer_discrete_bounds(self):
+        from cge.mcp import ActorDBOracle
+
+        oracle = ActorDBOracle(allow_auto_discovery=False)
+
+        g1, _, err1 = oracle.resolve_graph(source_path="examples/saas_unit_economics:evaluate_enterprise_plan")
+        assert err1 is None and g1 is not None
+        assert all(not n.source_reference.file.startswith("saas_unit_economics/") for n in g1.nodes.values())
+
+        seats = g1.nodes["seats"]
+        assert seats.source_reference.file == "evaluator.py"
+        assert seats.source_reference.line_range == [6, 6]
+        assert seats.bounds == {"min": 1.0, "max": None}
+        assert seats.data_type == "discrete"
+
+        assert g1.nodes["partner_rebate_rate"].source_reference.file == "evaluator.py"
+        assert g1.nodes["partner_rebate_rate"].source_reference.line_range == [10, 10]
+        assert g1.nodes["legacy_crm_score"].source_reference.file == "evaluator.py"
+        assert g1.nodes["legacy_crm_score"].source_reference.line_range == [11, 11]
+        assert g1.nodes["gross_bookings"].source_reference.file == "evaluator.py"
+        assert g1.nodes["gross_bookings"].source_reference.line_range == [28, 28]
+        assert g1.nodes["contribution_margin"].source_reference.file == "evaluator.py"
+        assert g1.nodes["contribution_margin"].source_reference.line_range == [37, 37]
+
+        g2, _, err2 = oracle.resolve_graph(source_path="examples/saas_unit_economics:simulate_cohort_retention")
+        assert err2 is None and g2 is not None
+        assert all(not n.source_reference.file.startswith("saas_unit_economics/") for n in g2.nodes.values())
+
+        initial_seats = g2.nodes["initial_seats"]
+        assert initial_seats.source_reference.file == "cohort_sim.py"
+        assert initial_seats.source_reference.line_range == [6, 6]
+        assert initial_seats.bounds == {"min": 1.0, "max": None}
+        assert g2.nodes["ending_seats"].source_reference.file == "cohort_sim.py"
+        assert g2.nodes["ending_seats"].source_reference.line_range == [29, 29]
+        assert g2.nodes["cumulative_margin"].source_reference.file == "cohort_sim.py"
+        assert g2.nodes["cumulative_margin"].source_reference.line_range == [30, 30]
+
+    def test_refinement_2_local_path_sensitivities_in_cge_trace(self):
+        from cge.mcp import ActorDBOracle
+
+        oracle = ActorDBOracle(allow_auto_discovery=False)
+        tr = oracle.trace(
+            source_path="examples/saas_unit_economics",
+            target_id="contribution_margin",
+            source_id="partner_rebate_rate",
+        )
+        assert tr["status"] == "OK"
+        assert tr["source_trace"]["total_derivative"] == pytest.approx(0.0, abs=1e-9)
+        assert tr["source_trace"]["is_causally_dead_to_target"] is True
+        paths = tr["source_trace"]["paths"]
+        assert len(paths) == 2
+        assert sorted(round(p["cumulative_sensitivity"], 6) for p in paths) == [-2288.0, 2288.0]
+
+    def test_refinement_3_open_domain_expansion_for_unclassified_leaves_in_cge_prove(self):
+        from cge.mcp import ActorDBOracle
+
+        oracle = ActorDBOracle(allow_auto_discovery=False)
+        pr_ok = oracle.prove(source_path="examples/saas_unit_economics", invariant_expr="seats >= 1")
+        assert pr_ok["status"] == "PROVEN"
+        assert pr_ok["domain_bounds"]["seats"] == [1.0, 120.0]
+
+        pr_fals = oracle.prove(source_path="examples/saas_unit_economics", invariant_expr="seats <= 80")
+        assert pr_fals["status"] == "FALSIFIED"
+        assert pr_fals["counterexample"]["seats"] >= 81.0
+        assert float(pr_fals["counterexample"]["seats"]).is_integer()
+
+    def test_refinement_4_relative_source_path_from_external_cwd_over_stdio(self, tmp_path: Path):
+        async def _external_cwd_scenario() -> None:
+            env = {**os.environ, "PYTHONUTF8": "1", "PYTHONPATH": str(WORKSPACE_ROOT)}
+            params = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "cge.mcp", "--transport", "stdio", "--no-auto-discovery"],
+                cwd=str(tmp_path),
+                env=env,
+            )
+            async with (
+                stdio_client(params) as (read_stream, write_stream),
+                ClientSession(read_stream, write_stream) as session,
+            ):
+                await session.initialize()
+
+                tr = _extract_mcp_payload(
+                    await session.call_tool(
+                        "cge_trace",
+                        {"source_path": "examples/saas_unit_economics", "target_id": "contribution_margin"},
+                    )
+                )
+                assert tr["status"] == "OK"
+
+                do_l2 = _extract_mcp_payload(
+                    await session.call_tool(
+                        "cge_do",
+                        {
+                            "source_path": "examples/saas_unit_economics:simulate_cohort_retention",
+                            "target_id": "cumulative_margin",
+                            "interventions": {"monthly_churn": 0.01},
+                        },
+                    )
+                )
+                assert do_l2["status"] == "OK"
+                assert do_l2["seal"] == "SAMPLED_VERIFIED"
+
+                sol_gov = _extract_mcp_payload(
+                    await session.call_tool("cge_solve", {"source_path": "examples/saas_governed"})
+                )
+                assert sol_gov["status"] == "OPTIMAL"
+                assert sol_gov["seal"] == "PROVEN"
+                assert sol_gov["objective_value"] == pytest.approx(4995.0, rel=1e-4)
+                assert sol_gov["controls"]["seat_price"] == pytest.approx(120.0)
+
+                tr_golden = _extract_mcp_payload(
+                    await session.call_tool(
+                        "cge_trace",
+                        {"source_path": "golden_case", "target_id": "profit"},
+                    )
+                )
+                assert tr_golden["status"] == "OK"
+                assert "brand_awareness" in tr_golden["dead_node_ids"]
+
+        anyio.run(_external_cwd_scenario)
+
+
+class TestCausalDiffWorkflowAndCLI:
+    def test_github_workflow_yaml_structure_and_ratification_alignment(self):
+        wf_path = WORKSPACE_ROOT / ".github" / "workflows" / "causal-diff.yml"
+        raw_text = wf_path.read_text(encoding="utf-8")
+        wf = yaml.safe_load(raw_text)
+
+        triggers = wf.get("on") or wf.get(True)
+        assert isinstance(triggers, dict)
+        assert "pull_request" in triggers
+        assert "workflow_dispatch" in triggers
+        paths = set(triggers["pull_request"]["paths"])
+        assert {"**/*.py", "**/*.json", "**/*.yaml", "**/*.yml", ".github/workflows/causal-diff.yml"}.issubset(paths)
+
+        targets = wf["jobs"]["causal-diff-audit"]["strategy"]["matrix"]["target"]
+        assert {t["subpath"] for t in targets} == {
+            "golden_case",
+            "examples/saas_governed",
+            "examples/saas_unit_economics",
+        }
+
+        assert "fetch-depth: 0" in raw_text
+        assert "github.event.pull_request.head.repo.full_name == github.repository" in raw_text
+        assert "invariant_regressions" in raw_text
+        assert "diagnostics" in raw_text
+        assert "policy_shifts" not in raw_text
+        assert "dead_nodes_added" not in raw_text
+
+    def test_git_cli_end_to_end_on_governed_package(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        pkg = repo / "examples" / "saas_governed"
+        shutil.copytree(WORKSPACE_ROOT / "examples" / "saas_governed", pkg)
+
+        def _git(*args: str) -> None:
+            subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True, check=True)
+
+        _git("init")
+        _git("config", "user.email", "test@example.com")
+        _git("config", "user.name", "Tester")
+        _git("add", ".")
+        _git("commit", "-m", "initial governed model")
+
+        pricing_path = pkg / "pricing.py"
+        original_pricing = pricing_path.read_text(encoding="utf-8")
+        pricing_path.write_text("# Equivalent refactor header\n" + original_pricing, encoding="utf-8")
+        _git("add", ".")
+        _git("commit", "-m", "refactor: benign comment")
+
+        cli_env = {**os.environ, "PYTHONPATH": str(WORKSPACE_ROOT)}
+        cmd = [
+            sys.executable,
+            "-m",
+            "cge.diff",
+            "--git-repo",
+            str(repo),
+            "--base-ref",
+            "HEAD~1",
+            "--head-ref",
+            "HEAD",
+            "--subpath",
+            "examples/saas_governed",
+            "--format",
+            "json",
+            "--check",
+        ]
+        res_pass = subprocess.run(cmd, capture_output=True, text=True, env=cli_env)
+        assert res_pass.returncode == 0, res_pass.stderr
+        data_pass = json.loads(res_pass.stdout)
+        assert data_pass["verdict"] == "PASS"
+        assert data_pass["is_semantically_equivalent"] is True
+
+        yaml_path = pkg / "actordb.yaml"
+        yaml_path.write_text(
+            yaml_path.read_text(encoding="utf-8").replace("600.0", "250.0"),
+            encoding="utf-8",
+        )
+        mutated_pricing = original_pricing.replace(
+            "    return {",
+            '    vanity_kpi = seats * 3.0\n    return {\n        "vanity_kpi": vanity_kpi,',
+        )
+        assert mutated_pricing != original_pricing
+        pricing_path.write_text(mutated_pricing, encoding="utf-8")
+        _git("add", ".")
+        _git("commit", "-m", "chore: weaken constraint and add vanity node")
+
+        res_fail = subprocess.run(cmd, capture_output=True, text=True, env=cli_env)
+        assert res_fail.returncode == 1
+        data_fail = json.loads(res_fail.stdout)
+        assert data_fail["verdict"] == "FAIL"
+        assert "HARD_CONSTRAINT_WEAKENED" in {r["code"] for r in data_fail["invariant_regressions"]}
+        assert "DEAD_NODE_ADDED" in {d["code"] for d in data_fail["diagnostics"]}
+
 
