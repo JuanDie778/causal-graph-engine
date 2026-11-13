@@ -3,17 +3,17 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import anyio
-from mcp.client.session import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
 import pytest
 import yaml
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from cge.diff import CausalDiffEngine, DiffVerdict, diff_git_revisions, diff_sources
 from cge.ingest_adapters import (
@@ -23,7 +23,6 @@ from cge.ingest_adapters import (
     RepositoryCausalEngine,
 )
 from cge.mcp.oracle import ActorDBOracle
-
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -785,6 +784,7 @@ class TestCausalDiffWorkflowAndCLI:
 
         assert "fetch-depth: 0" in raw_text
         assert "github.event.pull_request.head.repo.full_name == github.repository" in raw_text
+        assert "mcp>=1.0,<2.0" in raw_text
         assert "invariant_regressions" in raw_text
         assert "diagnostics" in raw_text
         assert "policy_shifts" not in raw_text
@@ -827,7 +827,7 @@ class TestCausalDiffWorkflowAndCLI:
             "json",
             "--check",
         ]
-        res_pass = subprocess.run(cmd, capture_output=True, text=True, env=cli_env)
+        res_pass = subprocess.run(cmd, check=False, capture_output=True, text=True, env=cli_env)
         assert res_pass.returncode == 0, res_pass.stderr
         data_pass = json.loads(res_pass.stdout)
         assert data_pass["verdict"] == "PASS"
@@ -847,7 +847,7 @@ class TestCausalDiffWorkflowAndCLI:
         _git("add", ".")
         _git("commit", "-m", "chore: weaken constraint and add vanity node")
 
-        res_fail = subprocess.run(cmd, capture_output=True, text=True, env=cli_env)
+        res_fail = subprocess.run(cmd, check=False, capture_output=True, text=True, env=cli_env)
         assert res_fail.returncode == 1
         data_fail = json.loads(res_fail.stdout)
         assert data_fail["verdict"] == "FAIL"

@@ -162,7 +162,7 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install numpy scipy sympy networkx pandas jsonschema pyyaml mcp
+            pip install numpy scipy sympy networkx pandas jsonschema pyyaml "mcp>=1.0,<2.0"
           fi
 
       - name: Execute Causal Diff (JSON Oracle + Markdown Report)

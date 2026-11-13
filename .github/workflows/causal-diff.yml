@@ -77,7 +77,7 @@ jobs:
           elif [ -f pyproject.toml ]; then
             pip install -e .
           else
-            pip install numpy scipy sympy networkx pandas jsonschema pyyaml mcp
+            pip install numpy scipy sympy networkx pandas jsonschema pyyaml "mcp>=1.0,<2.0"
           fi
 
       - name: Run Causal Diff Check (JSON + Markdown)
@@ -107,13 +107,17 @@ jobs:
             --check > "causal_diff_reports/${PREFIX}_diff.json"
           DIFF_EXIT=$?
           set -e
+          echo "exit_code=${DIFF_EXIT}" >> "$GITHUB_OUTPUT"
+          if [ ! -s "causal_diff_reports/${PREFIX}_diff.json" ] || [ "$DIFF_EXIT" -ge 2 ]; then
+            echo "ERROR: cge.diff failed to produce a valid JSON report (exit=${DIFF_EXIT})" >&2
+            exit 1
+          fi
           python -m cge.diff \
             --git-repo . \
             --base-ref "$EFFECTIVE_BASE" \
             --head-ref "$HEAD_REF" \
             --subpath "$SUBPATH" \
-            --format markdown > "causal_diff_reports/${PREFIX}_diff.md" || true
-          echo "exit_code=${DIFF_EXIT}" >> "$GITHUB_OUTPUT"
+            --format markdown > "causal_diff_reports/${PREFIX}_diff.md"
 
       - name: Publish Step Summary
         if: always()
@@ -144,9 +148,10 @@ jobs:
             const prefix = '${{ matrix.target.report_prefix }}';
             const marker = `<!-- actordb-causal-diff:${targetName} -->`;
             const mdPath = `causal_diff_reports/${prefix}_diff.md`;
-            const bodyContent = fs.existsSync(mdPath)
-              ? fs.readFileSync(mdPath, 'utf8')
-              : `Causal Diff report not generated for ${targetName}.`;
+            const rawMd = fs.existsSync(mdPath) ? fs.readFileSync(mdPath, 'utf8') : '';
+            const bodyContent = rawMd.trim().length > 0
+              ? rawMd
+              : `_Causal Diff operational error for \`${targetName}\` — inspect workflow job logs._`;
             const fullBody = `${marker}\n${bodyContent}`;
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
@@ -183,8 +188,8 @@ jobs:
 
           report_path = os.environ["REPORT_PATH"]
           diff_exit = int(os.environ.get("DIFF_EXIT", "1"))
-          if not os.path.exists(report_path):
-              print(f"ERROR: Missing Causal Diff report at {report_path}", file=sys.stderr)
+          if not os.path.exists(report_path) or os.path.getsize(report_path) == 0:
+              print(f"ERROR: Missing or empty Causal Diff report at {report_path}", file=sys.stderr)
               sys.exit(1)
 
           with open(report_path, "r", encoding="utf-8") as fh:
