@@ -2,6 +2,9 @@
 
 **Propósito:** definir el contrato único (`CausalIR` / `schema.json` v1.1) y las reglas 100% automáticas para que el motor descubra, audite y optimice cualquier sistema dentro del alcance del MVP sin configuración manual ni nombres cableados.
 
+> [!IMPORTANT]
+> **Alcance de la clasificación automática (§2) frente a la compuerta P5:** La inferencia automática de hojas `control` vs. `exogenous` descrita en §2 corresponde a la pila clásica `ASTIngestPipeline` (`cge/ingest.py`, utilizada por `golden_case` con convenciones `*_BOUNDS` + CSV). En la ingesta universal de paquetes Python vía `GenericPackageAdapter` (`cge/ingest_adapters/generic_adapter.py`), rige la **compuerta epistémica P5**: toda hoja sin contrato nace conservadoramente como `exogenous` salvo que esté gobernada por un sidecar `actordb.yaml` o se promueva explícitamente por consulta mediante `modifiable_controls` en `cge_solve`. Consulta [`docs/06_INGESTA_UNIVERSAL_P5_Y_ACTORDB_YAML.md`](06_INGESTA_UNIVERSAL_P5_Y_ACTORDB_YAML.md).
+
 ---
 
 ## 1. Principio de Aislamiento (Cero Fugas de Dominio)
