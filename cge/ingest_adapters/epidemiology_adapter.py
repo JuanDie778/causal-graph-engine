@@ -43,7 +43,7 @@ class EpidemiologyCausalAdapter:
 
     def _verify_symbolic_ode_conservation(self) -> bool:
         """Verifica simbólicamente sobre las expresiones del sistema SEIR que dS/dt + dE/dt + dI/dt + dR/dt == 0."""
-        S, E, inf_sym, R, N, beta, sigma, gamma = sp.symbols("S E I R N beta sigma gamma", real=True)
+        S, E, inf_sym, _R, N, beta, sigma, gamma = sp.symbols("S E I R N beta sigma gamma", real=True)
         dS = -(beta * S * inf_sym) / N
         dE = (beta * S * inf_sym) / N - sigma * E
         dI = sigma * E - gamma * inf_sym
@@ -87,7 +87,7 @@ class EpidemiologyCausalAdapter:
 
     @staticmethod
     def _seir_rhs(t: float, y: np.ndarray, N: float, beta: float, sigma: float, gamma: float) -> np.ndarray:
-        S, E, inf_pop, R = y
+        S, E, inf_pop, _R = y
         inf_flow = (beta * S * inf_pop) / N
         inc_flow = sigma * E
         rec_flow = gamma * inf_pop
@@ -243,7 +243,7 @@ class EpidemiologyCausalAdapter:
             t_peak = float(sol.t_events[0][0])
         else:
             peak_inf = max(float(I0), I_end)
-            t_peak = 0.0 if I0 >= I_end else float(t_max)
+            t_peak = 0.0 if I_end <= I0 else float(t_max)
         return {
             "peak_infection": peak_inf,
             "time_of_peak": t_peak,

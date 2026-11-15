@@ -15,18 +15,18 @@ import math
 import re
 import sys
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 import numpy as np
+import sympy as sp
 from scipy.optimize import Bounds, LinearConstraint, milp, minimize
 from scipy.stats import qmc
-import sympy as sp
 
 from ..schema import CausalGraph
 from ..solver import solve_problem
 from ..solver.strategies import _extract_linear_coeffs
-
 
 _MATH_FUNC_LOCALS: Dict[str, Any] = {
     "Piecewise": sp.Piecewise,
@@ -912,8 +912,28 @@ def _add_up(a: float, b: float) -> float:
     return 0.0 if s == 0.0 else s
 
 
+def _py_fma(x: float, y: float, z: float) -> float:
+    """Fallback IEEE-754 exacto (single-rounding round-ties-to-even) de `fma(x, y, z)` para Python < 3.13."""
+    if math.isnan(x) or math.isnan(y) or math.isnan(z):
+        return math.nan
+    if math.isinf(x) or math.isinf(y):
+        return (x * y) + z
+    if math.isinf(z):
+        return z
+    exact = Fraction(x) * Fraction(y) + Fraction(z)
+    if exact == 0:
+        return math.copysign(0.0, (x * y) + z)
+    try:
+        return float(exact)
+    except OverflowError:
+        return math.inf if exact > 0 else -math.inf
+
+
+_fma: Callable[[float, float, float], float] = getattr(math, "fma", _py_fma)
+
+
 def _finite_mul_down(a: float, b: float) -> float:
-    """Producto finito IEEE-754 con redondeo dirigido hacia `-inf` (`FE_DOWNWARD`) vía `math.fma`."""
+    """Producto finito IEEE-754 con redondeo dirigido hacia `-inf` (`FE_DOWNWARD`) vía `_fma`."""
     if a == 0.0 or b == 0.0:
         return 0.0
     p = a * b
@@ -923,14 +943,14 @@ def _finite_mul_down(a: float, b: float) -> float:
         return 0.0 if ((a > 0.0) == (b > 0.0)) else -_DBL_MIN_SUBNORMAL
     if abs(p) < 1e-290:
         return math.nextafter(p, -math.inf)
-    err = math.fma(a, b, -p)
+    err = _fma(a, b, -p)
     if err < 0.0:
         return math.nextafter(p, -math.inf)
     return p
 
 
 def _finite_mul_up(a: float, b: float) -> float:
-    """Producto finito IEEE-754 con redondeo dirigido hacia `+inf` (`FE_UPWARD`) vía `math.fma`."""
+    """Producto finito IEEE-754 con redondeo dirigido hacia `+inf` (`FE_UPWARD`) vía `_fma`."""
     if a == 0.0 or b == 0.0:
         return 0.0
     p = a * b
@@ -940,14 +960,14 @@ def _finite_mul_up(a: float, b: float) -> float:
         return _DBL_MIN_SUBNORMAL if ((a > 0.0) == (b > 0.0)) else 0.0
     if abs(p) < 1e-290:
         return math.nextafter(p, math.inf)
-    err = math.fma(a, b, -p)
+    err = _fma(a, b, -p)
     if err > 0.0:
         return math.nextafter(p, math.inf)
     return p
 
 
 def _recip_down(x: float) -> float:
-    """Recíproco `1.0 / x` (`x != 0`) con redondeo dirigido hacia `-inf` (`FE_DOWNWARD`) vía `math.fma`."""
+    """Recíproco `1.0 / x` (`x != 0`) con redondeo dirigido hacia `-inf` (`FE_DOWNWARD`) vía `_fma`."""
     if x == math.inf:
         return 0.0
     if x == -math.inf:
@@ -959,14 +979,14 @@ def _recip_down(x: float) -> float:
         return 0.0 if x > 0.0 else -_DBL_MIN_SUBNORMAL
     if abs(q) < 1e-290 or abs(x) > 1e290:
         return math.nextafter(q, -math.inf)
-    rem = math.fma(-q, x, 1.0)
+    rem = _fma(-q, x, 1.0)
     if (rem < 0.0) if x > 0.0 else (rem > 0.0):
         return math.nextafter(q, -math.inf)
     return q
 
 
 def _recip_up(x: float) -> float:
-    """Recíproco `1.0 / x` (`x != 0`) con redondeo dirigido hacia `+inf` (`FE_UPWARD`) vía `math.fma`."""
+    """Recíproco `1.0 / x` (`x != 0`) con redondeo dirigido hacia `+inf` (`FE_UPWARD`) vía `_fma`."""
     if x == -math.inf:
         return 0.0
     if x == math.inf:
@@ -978,7 +998,7 @@ def _recip_up(x: float) -> float:
         return _DBL_MIN_SUBNORMAL if x > 0.0 else 0.0
     if abs(q) < 1e-290 or abs(x) > 1e290:
         return math.nextafter(q, math.inf)
-    rem = math.fma(-q, x, 1.0)
+    rem = _fma(-q, x, 1.0)
     if (rem > 0.0) if x > 0.0 else (rem < 0.0):
         return math.nextafter(q, math.inf)
     return q
@@ -1270,7 +1290,7 @@ def _sqrt_down(x: float) -> float:
     s = math.sqrt(x)
     if s < 1e-145 or s > 1e145:
         return math.nextafter(s, -math.inf)
-    rem = math.fma(-s, s, x)
+    rem = _fma(-s, s, x)
     return math.nextafter(s, -math.inf) if rem < 0.0 else s
 
 
@@ -1282,7 +1302,7 @@ def _sqrt_up(x: float) -> float:
     s = math.sqrt(x)
     if s < 1e-145 or s > 1e145:
         return math.nextafter(s, math.inf)
-    rem = math.fma(-s, s, x)
+    rem = _fma(-s, s, x)
     return math.nextafter(s, math.inf) if rem > 0.0 else s
 
 
@@ -3069,7 +3089,7 @@ def _prove_single_expression(
             return None
         if any(not math.isfinite(val) for k_st, val in full_st.items() if k_st in required_eval_nodes):
             return None
-        for _, c_s in active_hard_cids_exprs.items():
+        for c_s in active_hard_cids_exprs.values():
             eff_tol = max(tol, 1e-11 if "==" in c_s else 1e-12)
             ok, _ = evaluate_constraint_at_state(c_s, full_st, local_syms=local_syms, tol=eff_tol)
             if not ok:
@@ -3287,7 +3307,7 @@ def _prove_single_expression(
                             return None
 
                 used_hard_slack = False
-                for _, c_s in active_hard_cids_exprs.items():
+                for c_s in active_hard_cids_exprs.values():
                     ok_strict_c, _ = evaluate_constraint_at_state(c_s, full_st, local_syms=local_syms, tol=1e-13)
                     if not ok_strict_c:
                         used_hard_slack = True
@@ -3565,7 +3585,7 @@ def _prove_single_expression(
                         full_c = _eval_st_c(cand)
                         val = float(_fn_eff_leaf(*[full_c[s] for s in _f_syms_eff]))
                         pen = 0.0
-                        for _, c_s in active_hard_cids_exprs.items():
+                        for c_s in active_hard_cids_exprs.values():
                             ok_c, marg_c = evaluate_constraint_at_state(c_s, full_c, local_syms=local_syms, tol=0.0)
                             if not ok_c or marg_c < 0.0:
                                 pen += 1e4 * (marg_c ** 2)

@@ -15,6 +15,7 @@ from .quantecon_adapter import QuantEconCausalAdapter
 from .supplychain_adapter import SupplyChainCausalAdapter
 
 __all__ = [
+    "GENERIC_PACKAGE_REPO_ID",
     "ActorDBSidecarSpec",
     "AdapterResponse",
     "ContractASTMismatchError",
@@ -22,7 +23,6 @@ __all__ = [
     "EpidemiologyCausalAdapter",
     "ExtractedClassSpec",
     "ExtractedFunctionSpec",
-    "GENERIC_PACKAGE_REPO_ID",
     "GenericPackageAdapter",
     "LoanTaxCausalAdapter",
     "QuantEconCausalAdapter",

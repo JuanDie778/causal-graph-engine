@@ -39,6 +39,7 @@ def _extract_tool_payload(call_result: Any) -> dict[str, Any]:
     return json.loads(call_result.content[0].text)
 
 
+@pytest.mark.slow
 def test_all_adapter_submodels_across_four_mcp_tools():
     """Verifica los 5 repositorios y sus 14 submodelos en `cge_trace`, `cge_do`, `cge_solve` y `cge_prove`."""
 
@@ -220,6 +221,7 @@ def test_implicit_submodel_routing_and_cache_isolation():
     assert r_exit["intervened_target_value"] == pytest.approx(45.0, rel=1e-6)
 
 
+@pytest.mark.slow
 def test_live_ast_mutation_cache_invalidation_and_causal_diff(tmp_path: Path):
     """Copia un repositorio a un directorio temporal con otro nombre, muta el AST en disco y verifica
     que tanto `ActorDBOracle` (invalidación de caché) como `diff_sources` detectan la rotura de conservación."""
@@ -275,6 +277,7 @@ def test_live_ast_mutation_cache_invalidation_and_causal_diff(tmp_path: Path):
     assert any("CONSERVATION" in str(c) or "INVARIANT" in str(c) for c in reg_codes)
 
 
+@pytest.mark.slow
 def test_adapter_error_paths_and_stdio_subprocess_roundtrip():
     """Verifica errores estructurados ante submodelos/rutas inválidas y transporte MCP `stdio` real."""
     oracle = ActorDBOracle(allow_auto_discovery=False)
@@ -377,6 +380,7 @@ def test_blackbox_interior_falsification_and_piecewise_zero_rate_proof():
     assert r_zero_rate["seal"] == "PROVEN"
 
 
+@pytest.mark.slow
 def test_causal_diff_blackbox_and_nondefault_submodel_mutations(tmp_path: Path):
     """Verifica que `diff_sources` audita mutaciones en cajas negras y en submodelos no por defecto a nivel directorio."""
     # 1. Mutación dentro del bucle de simulación `inventory_sim.py`

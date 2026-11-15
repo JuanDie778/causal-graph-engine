@@ -28,23 +28,23 @@ import contextlib
 import json
 import math
 import os
-from pathlib import Path
 import socket
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict
 
 import anyio
+import pytest
+import sympy as sp
+import uvicorn
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.memory import create_connected_server_and_client_session
-import pytest
 from sse_starlette.sse import AppStatus
-import sympy as sp
-import uvicorn
 
 from cge.mcp import (
     ActorDBOracle,
@@ -54,10 +54,9 @@ from cge.mcp import (
     cge_trace,
     create_mcp_server,
 )
-from cge.mcp.prover import _eval_expr_interval, _iv_cosh, _iv_pow, _iv_sinh
+from cge.mcp.prover import _eval_expr_interval, _iv_cosh, _iv_pow, _iv_sinh, _py_fma
 from cge.mcp.server import _safe_redirect_stdout_to_stderr
 from cge.schema import CausalGraph, Constraint, Edge, Node, SourceReference
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOLDEN_CASE_DIR = str(REPO_ROOT / "golden_case")
@@ -123,7 +122,7 @@ async def _shutdown_uvicorn_server(
     AppStatus.should_exit = True
     try:
         await asyncio.wait_for(serve_task, timeout=5.0)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
+    except (TimeoutError, asyncio.CancelledError):
         uv_srv.force_exit = True
         serve_task.cancel()
         with contextlib.suppress(BaseException):
@@ -149,7 +148,7 @@ class TestMCPProtocolAndTransport:
                 tool_map = {t.name: t for t in tools_resp.tools}
                 assert set(tool_map.keys()) == {"cge_trace", "cge_do", "cge_solve", "cge_prove"}
 
-                for _t_name, tool in tool_map.items():
+                for tool in tool_map.values():
                     assert tool.description and len(tool.description) > 20
                     assert isinstance(tool.inputSchema, dict)
                     assert tool.inputSchema.get("type") == "object"
@@ -179,6 +178,7 @@ class TestMCPProtocolAndTransport:
 
         anyio.run(_scenario)
 
+    @pytest.mark.slow
     def test_real_stdio_subprocess_transport_and_stdout_protection(self, tmp_path: Path):
         """Verifica que `python -m cge.mcp --transport stdio` funcione en un proceso real
         y que `print()` en el código analizado jamás corrompa el stream JSON-RPC en `stdout`.
@@ -320,6 +320,7 @@ class TestMCPProtocolAndTransport:
 
         asyncio.run(asyncio.wait_for(_http_scenario(), timeout=30.0))
 
+    @pytest.mark.slow
     def test_concurrent_streamable_http_and_stdout_thread_safety(self):
         """Verifica sesiones concurrentes (`asyncio.gather`) sobre `streamable-http` sin bloqueo del event loop
         y seguridad multi-hilo de la redirección de `stdout -> stderr`.
@@ -955,6 +956,19 @@ class TestCgeProve:
         assert p_quad["status"] == "PROVEN"
         assert p_quad["seal"] == "PROVEN"
         assert p_quad["proof_method"] == "interval_arithmetic_enclosure"
+
+        # 3. Verificar que el fallback IEEE-754 `_py_fma` (Python 3.11/3.12) produce el mismo certificado exacto
+        import cge.mcp.prover as prover_mod
+
+        orig_fma = prover_mod._fma
+        try:
+            prover_mod._fma = _py_fma
+            p_quad_fb = cge_prove(invariant_expr="y >= 0.9", graph_data=g_quad.to_dict())
+            assert p_quad_fb["status"] == "PROVEN"
+            assert p_quad_fb["seal"] == "PROVEN"
+            assert _py_fma(1.0 + 2.0**-52, 1.0 + 2.0**-52, -(1.0 + 2.0**-51)) == 2.0**-104
+        finally:
+            prover_mod._fma = orig_fma
 
     def test_trigonometric_and_hyperbolic_outward_interval_bounds_and_proofs(self):
         # 1. Auditoría directa de inclusión garantizada outward-rounded en `_eval_expr_interval`

@@ -13,14 +13,14 @@ from .server import (
 )
 
 __all__ = [
-    "ActorDBOracle",
     "SERVER_INSTRUCTIONS",
-    "create_mcp_server",
-    "mcp",
-    "default_oracle",
-    "cge_trace",
+    "ActorDBOracle",
     "cge_do",
-    "cge_solve",
     "cge_prove",
+    "cge_solve",
+    "cge_trace",
+    "create_mcp_server",
+    "default_oracle",
+    "mcp",
     "prove_on_graph",
 ]

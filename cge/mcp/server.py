@@ -19,7 +19,6 @@ from mcp.server.fastmcp import FastMCP
 
 from .oracle import ActorDBOracle
 
-
 _STDOUT_REDIRECT_LOCK = threading.Lock()
 _STDOUT_REDIRECT_DEPTH = 0
 _SAVED_REAL_STDOUT: Any = None

@@ -38,7 +38,6 @@ from .prover import (
     prove_on_graph,
 )
 
-
 _PROPOSITIONAL_CONSTR_RE = re.compile(
     r"(=>|->|<=>|<->|&&|\|\||!=|!(?!=)|\b(?:and|or|not|And|Or|Not|Implies)\b|(?<![<=>!])<(?![=>-])|(?<![<=>-])>(?!=))"
 )
@@ -106,10 +105,7 @@ def _normalize_graph_for_solver(
             b = n.bounds or {}
             b_min = b.get("min") if isinstance(b, dict) else None
             b_max = b.get("max") if isinstance(b, dict) else None
-            if n.data_type == "boolean":
-                bool_syms.add(sym)
-                node_bounds[sym] = (0.0, 1.0)
-            elif (
+            if n.data_type == "boolean" or (
                 n.data_type == "discrete"
                 and b_min is not None
                 and b_max is not None
@@ -569,7 +565,7 @@ class ActorDBOracle:
                         return self._cache[sig], True, None
                 try:
                     if src_clean.lower().endswith(".json"):
-                        with open(src_clean, "r", encoding="utf-8") as f:
+                        with open(src_clean, encoding="utf-8") as f:
                             data = json.load(f)
                         g = CausalGraph.from_dict(data)
                     else:
@@ -1287,9 +1283,9 @@ class ActorDBOracle:
         """Ejecuta una intervención contrafactual exacta de Pearl `do(I)` mutilando aristas entrantes."""
         hints_d: List[str] = []
         if isinstance(interventions, dict):
-            hints_d.extend(str(k) for k in interventions.keys())
+            hints_d.extend(str(k) for k in interventions)
         if isinstance(context, dict):
-            hints_d.extend(str(k) for k in context.keys())
+            hints_d.extend(str(k) for k in context)
         graph, cache_hit, err = self.resolve_graph(
             source_path=source_path,
             graph_data=graph_data,
@@ -1787,13 +1783,13 @@ class ActorDBOracle:
         """Calcula la receta óptima certificada respetando todas las invariantes duras y la compuerta epistémica."""
         hints_s: List[str] = []
         if isinstance(fixed_controls, dict):
-            hints_s.extend(str(k) for k in fixed_controls.keys())
+            hints_s.extend(str(k) for k in fixed_controls)
         if isinstance(exo_overrides, dict):
-            hints_s.extend(str(k) for k in exo_overrides.keys())
+            hints_s.extend(str(k) for k in exo_overrides)
         if isinstance(modifiable_controls, (list, tuple)):
             hints_s.extend(str(k) for k in modifiable_controls)
         if isinstance(control_bounds, dict):
-            hints_s.extend(str(k) for k in control_bounds.keys())
+            hints_s.extend(str(k) for k in control_bounds)
         graph, cache_hit, err = self.resolve_graph(
             source_path=source_path,
             graph_data=graph_data,
@@ -1803,7 +1799,7 @@ class ActorDBOracle:
         if err is not None or graph is None:
             return _clean_json_val(err)
 
-        mod_set_hint = set(str(x) for x in modifiable_controls) if isinstance(modifiable_controls, (list, tuple)) else set()
+        mod_set_hint = {str(x) for x in modifiable_controls} if isinstance(modifiable_controls, (list, tuple)) else set()
 
         def _solve_submodel_matches(g_cand: CausalGraph) -> bool:
             if target_id is not None and target_id not in g_cand.nodes:
@@ -1820,12 +1816,13 @@ class ActorDBOracle:
                 for k in fixed_controls
             ):
                 return False
-            if isinstance(exo_overrides, dict) and any(
-                k not in g_cand.nodes or g_cand.nodes[k].category != "exogenous" or k in mod_set_hint
-                for k in exo_overrides
-            ):
-                return False
-            return True
+            return not (
+                isinstance(exo_overrides, dict)
+                and any(
+                    k not in g_cand.nodes or g_cand.nodes[k].category != "exogenous" or k in mod_set_hint
+                    for k in exo_overrides
+                )
+            )
 
         if not _solve_submodel_matches(graph):
             alt_s = self._resolve_alternate_adapter_submodel(
@@ -2360,7 +2357,7 @@ class ActorDBOracle:
         if invariant_expr:
             hints_p.extend(_extract_identifiers(invariant_expr))
         if isinstance(domain_bounds, dict):
-            hints_p.extend(str(k) for k in domain_bounds.keys())
+            hints_p.extend(str(k) for k in domain_bounds)
         if constraint_id:
             hints_p.append(str(constraint_id))
 
@@ -2377,16 +2374,14 @@ class ActorDBOracle:
             if invariant_expr
             else []
         )
-        dom_req_actors = [str(k) for k in domain_bounds.keys()] if isinstance(domain_bounds, dict) else []
+        dom_req_actors = [str(k) for k in domain_bounds] if isinstance(domain_bounds, dict) else []
 
         def _prove_submodel_matches(g_cand: CausalGraph) -> bool:
             if constraint_id and constraint_id not in g_cand.constraints:
                 return False
             if any(rid not in g_cand.nodes for rid in inv_req_actors):
                 return False
-            if any(dk not in g_cand.nodes for dk in dom_req_actors):
-                return False
-            return True
+            return not any(dk not in g_cand.nodes for dk in dom_req_actors)
 
         if not _prove_submodel_matches(graph):
             alt_p = self._resolve_alternate_adapter_submodel(
