@@ -54,7 +54,7 @@ from cge.mcp import (
     cge_trace,
     create_mcp_server,
 )
-from cge.mcp.prover import _eval_expr_interval, _iv_cosh, _iv_pow, _iv_sinh
+from cge.mcp.prover import _eval_expr_interval, _iv_cosh, _iv_pow, _iv_sinh, _py_fma
 from cge.mcp.server import _safe_redirect_stdout_to_stderr
 from cge.schema import CausalGraph, Constraint, Edge, Node, SourceReference
 
@@ -956,6 +956,19 @@ class TestCgeProve:
         assert p_quad["status"] == "PROVEN"
         assert p_quad["seal"] == "PROVEN"
         assert p_quad["proof_method"] == "interval_arithmetic_enclosure"
+
+        # 3. Verificar que el fallback IEEE-754 `_py_fma` (Python 3.11/3.12) produce el mismo certificado exacto
+        import cge.mcp.prover as prover_mod
+
+        orig_fma = prover_mod._fma
+        try:
+            prover_mod._fma = _py_fma
+            p_quad_fb = cge_prove(invariant_expr="y >= 0.9", graph_data=g_quad.to_dict())
+            assert p_quad_fb["status"] == "PROVEN"
+            assert p_quad_fb["seal"] == "PROVEN"
+            assert _py_fma(1.0 + 2.0**-52, 1.0 + 2.0**-52, -(1.0 + 2.0**-51)) == 2.0**-104
+        finally:
+            prover_mod._fma = orig_fma
 
     def test_trigonometric_and_hyperbolic_outward_interval_bounds_and_proofs(self):
         # 1. Auditoría directa de inclusión garantizada outward-rounded en `_eval_expr_interval`
