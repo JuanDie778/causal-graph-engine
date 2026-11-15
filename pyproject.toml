@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "actordb-cge"
+version = "0.1.0"
+description = "ActorDB & Causal Graph Engine: compilación de código Python a modelos causales verificables, oráculo MCP y Causal Diff para CI/CD."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "sympy>=1.12",
+    "networkx>=3.1",
+    "pandas>=2.0",
+    "PyYAML>=6.0",
+    "jsonschema>=4.0",
+    "mcp>=1.28,<2.0",   # mcp>=2.0 elimina mcp.server.fastmcp (usado en cge/mcp/server.py)
+]
+
+[project.optional-dependencies]
+ui  = ["fastapi>=0.110", "uvicorn>=0.27", "pydantic>=2.0"]
+dev = ["actordb-cge[ui]", "pytest>=8.0", "anyio>=4.0", "httpx>=0.27", "psutil>=5.9", "ruff>=0.6"]
+
+[project.scripts]
+actordb-mcp = "cge.mcp.__main__:main"
+cge-diff    = "cge.diff.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["cge", "cge.*"]          # layout plano con varios top-level: solo empaquetamos el motor
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "SIM", "C4", "PERF", "RUF", "PLW1510"]
+ignore = [
+    "UP006", "UP007", "UP035", "UP045", "UP037",   # mantener estilo typing.Dict/Optional ya extendido en el código
+    "RUF001", "RUF002", "RUF003",                  # caracteres Unicode legítimos (español, símbolos matemáticos)
+    "RUF005", "RUF012", "RUF046", "B008", "B905",
+    "SIM102", "SIM105", "SIM108", "SIM117",
+    "PERF203", "PERF401", "PERF403",
+]

@@ -1,0 +1,3 @@
+# Blindaje de los artefactos sellados del baseline: bytes exactos en cualquier OS/autocrlf
+benchmark/** -text
+golden_case/** -text

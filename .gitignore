@@ -27,3 +27,10 @@ benchmark_variants/
 
 # Swarm agent temporary artifacts
 .agents/
+
+# Packaging / build / lint
+build/
+dist/
+*.egg-info/
+.ruff_cache/
+causal_diff_reports/
