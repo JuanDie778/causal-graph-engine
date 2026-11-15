@@ -1314,8 +1314,10 @@ class LoanTaxCausalAdapter:
         return None
 
     def _evaluate_loan_or_tax(self, ctx: QueryContext, is_counterfactual: bool = False) -> AdapterResponse:
-        p = self._merged_params(ctx) if (ctx.turn_index > 1 or ctx.question_type.upper() == "Q8" or not ctx.parameters) else dict(
-            {**extract_inline_numeric_assignments(self._clean_thousands_separators(ctx.prompt)), **ctx.parameters}
+        p = (
+            self._merged_params(ctx)
+            if (ctx.turn_index > 1 or ctx.question_type.upper() == "Q8" or not ctx.parameters)
+            else {**extract_inline_numeric_assignments(self._clean_thousands_separators(ctx.prompt)), **ctx.parameters}
         )
         p_low = self._clean_thousands_separators(ctx.prompt).lower()
 

@@ -1,9 +1,11 @@
 """Ejecutor CLI para iniciar el servidor UI y abrir la visualización en el navegador."""
 from __future__ import annotations
+
 import argparse
 import os
 import sys
 import webbrowser
+
 import uvicorn
 
 from ui.server import app, engine_state

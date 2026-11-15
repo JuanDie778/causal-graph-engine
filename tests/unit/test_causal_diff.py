@@ -5,6 +5,7 @@ import copy
 import json
 import subprocess
 from pathlib import Path
+
 import pytest
 
 from cge.diff import (
@@ -20,7 +21,6 @@ from cge.diff import (
 from cge.diff.__main__ import main as diff_cli_main
 from cge.ingest import compile_source_to_ir
 from cge.schema import CausalGraph, Constraint, Edge, Node, SourceReference
-
 
 # ==============================================================================
 # Helpers de Construcción de Grafos y Repositorios Git Temporales
@@ -69,7 +69,7 @@ def compute_net_profit(revenue: float = 75.0, ad_spend: float = 20.0{cancel_line
 
 
 def _git(cwd: Path, *args: str) -> None:
-    res = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    res = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False)
     assert res.returncode == 0, f"git {' '.join(args)} failed: {res.stderr}"
 
 

@@ -15,8 +15,8 @@ __all__ = [
     "CausalDiffError",
     "CausalDiffReport",
     "DiffVerdict",
+    "diff_git_revisions",
     "diff_graphs",
     "diff_sources",
-    "diff_git_revisions",
     "load_causal_graph",
 ]

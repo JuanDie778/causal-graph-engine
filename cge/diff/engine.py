@@ -11,13 +11,13 @@ Compara formalmente dos estados de un sistema (`base` M_0 vs `head` M_1) y diagn
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
 import json
 import math
 import os
-from pathlib import Path
 import re
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import networkx as nx
@@ -41,7 +41,7 @@ class CausalDiffError(ValueError):
     """Excepción formal emitida ante entradas o referencias Git inválidas en Causal Diff."""
 
 
-class DiffVerdict(str, Enum):
+class DiffVerdict(StrEnum):
     PASS = "PASS"
     WARN = "WARN"
     FAIL = "FAIL"
@@ -205,7 +205,7 @@ def load_causal_graph(
             return g
         if os.path.isfile(s):
             if s.lower().endswith(".json"):
-                with open(s, "r", encoding="utf-8") as f:
+                with open(s, encoding="utf-8") as f:
                     data = json.load(f)
                 g = CausalGraph.from_dict(data)
                 if system_id:
@@ -983,8 +983,7 @@ class CausalDiffEngine:
                 "reason": policy_optimality.get("summary_reason", "Optimal policy shifted between base and head."),
             })
 
-        for t4_reg in policy_optimality.get("local_optima_regressions", []):
-            diagnostics.append(t4_reg)
+        diagnostics.extend(policy_optimality.get("local_optima_regressions", []))
 
         # ------------------------------------------------------------------
         # 6. Síntesis del Veredicto y Equivalencia Semántica
@@ -1425,7 +1424,7 @@ class CausalDiffEngine:
                         f"with symbolic residual R = {chk.get('symbolic_residual')} != 0."
                     ),
                 })
-        for key, _chk in b_cons_viol.items():
+        for key in b_cons_viol:
             if key not in h_cons_viol:
                 fixed.append({
                     "code": "CONSERVATION_INVARIANT_RESTORED",

@@ -28,23 +28,23 @@ import contextlib
 import json
 import math
 import os
-from pathlib import Path
 import socket
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict
 
 import anyio
+import pytest
+import sympy as sp
+import uvicorn
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.memory import create_connected_server_and_client_session
-import pytest
 from sse_starlette.sse import AppStatus
-import sympy as sp
-import uvicorn
 
 from cge.mcp import (
     ActorDBOracle,
@@ -57,7 +57,6 @@ from cge.mcp import (
 from cge.mcp.prover import _eval_expr_interval, _iv_cosh, _iv_pow, _iv_sinh
 from cge.mcp.server import _safe_redirect_stdout_to_stderr
 from cge.schema import CausalGraph, Constraint, Edge, Node, SourceReference
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOLDEN_CASE_DIR = str(REPO_ROOT / "golden_case")
@@ -123,7 +122,7 @@ async def _shutdown_uvicorn_server(
     AppStatus.should_exit = True
     try:
         await asyncio.wait_for(serve_task, timeout=5.0)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
+    except (TimeoutError, asyncio.CancelledError):
         uv_srv.force_exit = True
         serve_task.cancel()
         with contextlib.suppress(BaseException):
@@ -149,7 +148,7 @@ class TestMCPProtocolAndTransport:
                 tool_map = {t.name: t for t in tools_resp.tools}
                 assert set(tool_map.keys()) == {"cge_trace", "cge_do", "cge_solve", "cge_prove"}
 
-                for _t_name, tool in tool_map.items():
+                for tool in tool_map.values():
                     assert tool.description and len(tool.description) > 20
                     assert isinstance(tool.inputSchema, dict)
                     assert tool.inputSchema.get("type") == "object"

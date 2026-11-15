@@ -19,14 +19,13 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 import numpy as np
+import sympy as sp
 from scipy.optimize import Bounds, LinearConstraint, milp, minimize
 from scipy.stats import qmc
-import sympy as sp
 
 from ..schema import CausalGraph
 from ..solver import solve_problem
 from ..solver.strategies import _extract_linear_coeffs
-
 
 _MATH_FUNC_LOCALS: Dict[str, Any] = {
     "Piecewise": sp.Piecewise,
@@ -3069,7 +3068,7 @@ def _prove_single_expression(
             return None
         if any(not math.isfinite(val) for k_st, val in full_st.items() if k_st in required_eval_nodes):
             return None
-        for _, c_s in active_hard_cids_exprs.items():
+        for c_s in active_hard_cids_exprs.values():
             eff_tol = max(tol, 1e-11 if "==" in c_s else 1e-12)
             ok, _ = evaluate_constraint_at_state(c_s, full_st, local_syms=local_syms, tol=eff_tol)
             if not ok:
@@ -3287,7 +3286,7 @@ def _prove_single_expression(
                             return None
 
                 used_hard_slack = False
-                for _, c_s in active_hard_cids_exprs.items():
+                for c_s in active_hard_cids_exprs.values():
                     ok_strict_c, _ = evaluate_constraint_at_state(c_s, full_st, local_syms=local_syms, tol=1e-13)
                     if not ok_strict_c:
                         used_hard_slack = True
@@ -3565,7 +3564,7 @@ def _prove_single_expression(
                         full_c = _eval_st_c(cand)
                         val = float(_fn_eff_leaf(*[full_c[s] for s in _f_syms_eff]))
                         pen = 0.0
-                        for _, c_s in active_hard_cids_exprs.items():
+                        for c_s in active_hard_cids_exprs.values():
                             ok_c, marg_c = evaluate_constraint_at_state(c_s, full_c, local_syms=local_syms, tol=0.0)
                             if not ok_c or marg_c < 0.0:
                                 pen += 1e4 * (marg_c ** 2)

@@ -1126,7 +1126,7 @@ def collect_session_epistemic_facts(ctx: QueryContext, valid_identifiers: Set[st
                     facts["T1_still_dead"] = True
                     if t_idx is not None:
                         facts[f"T{t_idx}_dead_node"] = True
-        for pk in (turn.get("parameters") or {}).keys():
+        for pk in turn.get("parameters") or {}:
             facts[pk] = True
             if t_idx is not None:
                 facts[f"T{t_idx}_{pk}"] = True

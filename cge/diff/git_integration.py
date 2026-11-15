@@ -3,15 +3,14 @@ from __future__ import annotations
 
 import io
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tarfile
 import tempfile
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 from .engine import CausalDiffEngine, CausalDiffError, CausalDiffReport
-
 
 _IGNORED_WORKTREE_DIRS = {
     ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -26,6 +25,7 @@ def _run_git(repo_dir: str, args: list[str], binary: bool = False) -> subprocess
         capture_output=True,
         text=not binary,
         encoding=None if binary else "utf-8",
+        check=False,
     )
 
 
