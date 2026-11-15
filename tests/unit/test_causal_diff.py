@@ -699,6 +699,7 @@ class TestDeadNodesDetection:
 # ==============================================================================
 
 class TestGitIntegrationAndCLI:
+    @pytest.mark.slow
     def test_multi_commit_git_workflow_and_worktree_diff(self, tmp_path: Path):
         repo = tmp_path / "mini_repo"
         pkg = repo / "pricing_core"
@@ -796,6 +797,7 @@ class TestGitIntegrationAndCLI:
         rc_err = diff_cli_main(["--git-repo", str(non_git)])
         assert rc_err == 2
 
+    @pytest.mark.slow
     def test_empty_causal_graphs_and_real_repo_git_diff(self):
         # 1. Grafos vacíos (0 actores) no deben lanzar excepciones en ningún sub-analizador
         g_empty_a = CausalGraph(system_id="empty_a")

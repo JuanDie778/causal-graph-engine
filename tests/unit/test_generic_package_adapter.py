@@ -400,6 +400,7 @@ submodels:
 
 
 class TestGenericPackageCausalDiffAndGit:
+    @pytest.mark.slow
     def test_multi_submodel_diff_across_python_and_sidecar_mutations(self, tmp_path: Path):
         v1 = _build_unseen_saas_package(
             tmp_path / "pkg_v1",
@@ -437,6 +438,7 @@ class TestGenericPackageCausalDiffAndGit:
         assert "CONTROL_BOUNDS_WEAKENED" in inv_codes
         assert any(d["node"] == "vanity_badge_score" for d in rep_reg.dead_nodes["added_dead_nodes"])
 
+    @pytest.mark.slow
     def test_git_revisions_diff_with_actordb_yaml(self, tmp_path: Path):
         repo = tmp_path / "saas_git_repo"
         repo.mkdir()
@@ -500,6 +502,7 @@ def _extract_mcp_payload(call_result: Any) -> dict[str, Any]:
 
 
 class TestMCPStdioWireIntegrationOnGenericPackage:
+    @pytest.mark.slow
     def test_stdio_wire_protocol_on_examples_saas_package(self):
         saas_pkg = WORKSPACE_ROOT / "examples" / "saas_unit_economics"
         assert saas_pkg.is_dir()
@@ -706,6 +709,7 @@ class TestFourLiveAuditRefinements:
         pr_gov_full = oracle.prove(source_path="examples/saas_governed")
         assert pr_gov_full["status"] == "FALSIFIED"
 
+    @pytest.mark.slow
     def test_refinement_4_relative_source_path_from_external_cwd_over_stdio(self, tmp_path: Path):
         async def _external_cwd_scenario() -> None:
             env = {**os.environ, "PYTHONUTF8": "1", "PYTHONPATH": str(WORKSPACE_ROOT)}
@@ -790,6 +794,7 @@ class TestCausalDiffWorkflowAndCLI:
         assert "policy_shifts" not in raw_text
         assert "dead_nodes_added" not in raw_text
 
+    @pytest.mark.slow
     def test_git_cli_end_to_end_on_governed_package(self, tmp_path: Path):
         repo = tmp_path / "repo"
         pkg = repo / "examples" / "saas_governed"

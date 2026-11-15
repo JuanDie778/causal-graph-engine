@@ -179,6 +179,7 @@ class TestMCPProtocolAndTransport:
 
         anyio.run(_scenario)
 
+    @pytest.mark.slow
     def test_real_stdio_subprocess_transport_and_stdout_protection(self, tmp_path: Path):
         """Verifica que `python -m cge.mcp --transport stdio` funcione en un proceso real
         y que `print()` en el código analizado jamás corrompa el stream JSON-RPC en `stdout`.
@@ -320,6 +321,7 @@ class TestMCPProtocolAndTransport:
 
         asyncio.run(asyncio.wait_for(_http_scenario(), timeout=30.0))
 
+    @pytest.mark.slow
     def test_concurrent_streamable_http_and_stdout_thread_safety(self):
         """Verifica sesiones concurrentes (`asyncio.gather`) sobre `streamable-http` sin bloqueo del event loop
         y seguridad multi-hilo de la redirección de `stdout -> stderr`.
